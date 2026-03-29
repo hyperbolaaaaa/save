@@ -1029,7 +1029,12 @@ async def run() -> None:
     if settings.user_session_string:
         user_client_kwargs["session_string"] = settings.user_session_string
 
-    user_client = Client(**user_client_kwargs)
+    user_client = Client(
+        "gen_user",
+        api_id=settings.api_id,
+        api_hash=settings.api_hash,
+        session_string=settings.session_string
+    )
     bot_client = Client(
         name=settings.bot_session_name,
         api_id=settings.api_id,
