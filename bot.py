@@ -687,12 +687,17 @@ async def run() -> None:
     async with db.session() as session:
         await Repository(session).ensure_runtime_settings()
 
-    user_client = Client(name=settings.user_session_name, api_id=settings.api_id, api_hash=settings.api_hash)
     user_client = Client(
         name="user_session",
         api_id=settings.api_id,
         api_hash=settings.api_hash,
         session_string=os.getenv("SESSION_STRING")
+    )
+    bot_client = Client(
+        name=settings.bot_session_name,
+        api_id=settings.api_id,
+        api_hash=settings.api_hash,
+        bot_token=settings.bot_token,
     )
 
     listener = SavedMessagesListener(user_client, db, settings)
