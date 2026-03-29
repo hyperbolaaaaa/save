@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     max_retries: int = Field(5, alias="MAX_RETRIES")
     album_flush_seconds: float = Field(1.8, alias="ALBUM_FLUSH_SECONDS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
-    user_session_string: str = Field(..., alias="SESSION_STRING")
+    # user_session_string: str = Field(..., alias="SESSION_STRING")
 
 
     @field_validator("admin_ids", mode="before")
@@ -692,7 +692,7 @@ async def run() -> None:
         name=settings.user_session_name,
         api_id=settings.api_id,
         api_hash=settings.api_hash,
-        session_string=settings.user_session_string,
+        session_string="BQHr04QAUannPk7_63cRnlEfSBPBHoQIw65YoxP6nkBchXS_i43X9WViKtCLWa5dJXNP5kHN2gkENWajhqX-CR7ir8F5Ye1roWzMeAgj47LkLslJThMDUH69Q9kxh04flsyzv5qbHx-OrMV3KKGpLjoIYrGvXh_zIs5YI-JQIOIXwd_f7ERTx1eeNxMLawJLUKU0z2FBzw1dYNNL8dgn-Hi4a25VTI_GMy5lADx4_3FMqgLVN9P-JZpbg4iFmENz03yHE7ESe8cYqRW0KisPOwxx0nibm8mOyBLQT6pZ1SolgeNV8roNwc4b3kOUI0domGvxv6YepqY1d8VYpID7BG5IsdsA4QAAAAH62YOxAA",
     )
 
     bot_client = Client(
