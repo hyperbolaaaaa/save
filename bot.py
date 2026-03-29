@@ -1,4 +1,4 @@
-
+from pyrogram.enums import ParseMode
 from __future__ import annotations
 
 import asyncio
@@ -725,7 +725,7 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
         )
 
     async def send_home(message: Message) -> None:
-        await message.reply_text(await build_status_text(), reply_markup=main_kb(), parse_mode="HTML")
+        await message.reply_text(await build_status_text(), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
 
     @bot_client.on_message(filters.command(["start", "help"]))
     async def start_cmd(_: Client, message: Message) -> None:
@@ -757,19 +757,19 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
             runtime = await repo.get_runtime_settings()
 
             if data == "ui:home":
-                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode="HTML")
+                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:settings":
-                await query.message.edit_text("⚙️ <b>Settings Menu</b>", reply_markup=settings_kb(), parse_mode="HTML")
+                await query.message.edit_text("⚙️ <b>Settings Menu</b>", reply_markup=settings_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:targets":
-                await query.message.edit_text("🎯 <b>Targets Menu</b>", reply_markup=targets_kb(), parse_mode="HTML")
+                await query.message.edit_text("🎯 <b>Targets Menu</b>", reply_markup=targets_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:queue":
-                await query.message.edit_text("📦 <b>Queue Menu</b>", reply_markup=queue_kb(), parse_mode="HTML")
+                await query.message.edit_text("📦 <b>Queue Menu</b>", reply_markup=queue_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:admins":
-                await query.message.edit_text("👥 <b>Admins Menu</b>", reply_markup=admins_kb(), parse_mode="HTML")
+                await query.message.edit_text("👥 <b>Admins Menu</b>", reply_markup=admins_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:toggle":
                 runtime.is_enabled = not runtime.is_enabled
                 await session.commit()
-                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode="HTML")
+                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
             elif data == "ui:toggle_autodel":
                 runtime.auto_delete_saved = not runtime.auto_delete_saved
                 await session.commit()
