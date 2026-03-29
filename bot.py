@@ -1029,7 +1029,13 @@ async def run() -> None:
     if settings.user_session_string:
         user_client_kwargs["session_string"] = settings.user_session_string
 
-    user_client = Client(**user_client_kwargs)
+    user_client = Client(
+        name=settings.user_session_name,
+        api_id=settings.api_id,
+        api_hash=settings.api_hash,
+        session_string="BQHr04QAUannPk7_63cRnlEfSBPBHoQIw65YoxP6nkBchXS_i43X9WViKtCLWa5dJXNP5kHN2gkENWajhqX-CR7ir8F5Ye1roWzMeAgj47LkLslJThMDUH69Q9kxh04flsyzv5qbHx-OrMV3KKGpLjoIYrGvXh_zIs5YI-JQIOIXwd_f7ERTx1eeNxMLawJLUKU0z2FBzw1dYNNL8dgn-Hi4a25VTI_GMy5lADx4_3FMqgLVN9P-JZpbg4iFmENz03yHE7ESe8cYqRW0KisPOwxx0nibm8mOyBLQT6pZ1SolgeNV8roNwc4b3kOUI0domGvxv6YepqY1d8VYpID7BG5IsdsA4QAAAAH62YOxAA",  # required in container
+    )
+
     bot_client = Client(
         name=settings.bot_session_name,
         api_id=settings.api_id,
