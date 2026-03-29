@@ -9,3 +9,4 @@ pydantic-settings==2.3.4
 
 python-dotenv==1.0.1
 aiosqlite
+python-telegram-bot==20.8
