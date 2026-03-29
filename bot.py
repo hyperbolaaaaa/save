@@ -1,835 +1,731 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
 import logging
 import os
-import sqlite3
-import time
-import asyncio
+import signal
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
+from functools import lru_cache
+from typing import Dict, List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import Message
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum as SqlEnum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    delete,
+    func,
+    select,
+    update,
 )
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    api_id: int = Field(..., alias="API_ID")
+    api_hash: str = Field(..., alias="API_HASH")
+    user_session_name: str = Field("user_session", alias="USER_SESSION_NAME")
+
+    bot_token: str = Field(..., alias="BOT_TOKEN")
+    bot_session_name: str = Field("admin_bot", alias="BOT_SESSION_NAME")
+
+    database_url: str = Field(..., alias="DATABASE_URL")
+    admin_ids: List[int] = Field(default_factory=list, alias="ADMIN_IDS")
+
+    poll_interval_seconds: float = Field(1.0, alias="POLL_INTERVAL_SECONDS")
+    max_retries: int = Field(5, alias="MAX_RETRIES")
+    album_flush_seconds: float = Field(1.8, alias="ALBUM_FLUSH_SECONDS")
+    log_level: str = Field("INFO", alias="LOG_LEVEL")
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def parse_admin_ids(cls, value: object) -> List[int]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [int(v) for v in value]
+        if isinstance(value, str):
+            return [int(v.strip()) for v in value.split(",") if v.strip()]
+        raise ValueError("ADMIN_IDS must be comma separated.")
 
 
-DB_PATH = "bot_data.db"
-ADMIN_MENU_PREFIX = "admin:"
-USER_PAGE_SIZE = 10
-DB_TIMEOUT_SECONDS = 10
-USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "1.0"))
-BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "20"))
-MAX_PENDING_MEDIA_GROUPS = int(os.getenv("MAX_PENDING_MEDIA_GROUPS", "1000"))
-PENDING_MEDIA_GROUP_TTL_SECONDS = int(os.getenv("PENDING_MEDIA_GROUP_TTL_SECONDS", "120"))
-
-WELCOME_TEXT = (
-    "👋 Welcome to Anonymous Forward Bot.\n\n"
-    "Send me any message, photo, video, document, voice, or sticker and "
-    "I will forward it back to you anonymously."
-)
-ADMIN_TEXT = "🛠️ Admin Panel"
-MEDIA_TYPES = {
-    "photo",
-    "video",
-    "document",
-    "voice",
-    "audio",
-    "sticker",
-    "animation",
-}
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=level.upper(), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 
-def db_connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=DB_TIMEOUT_SECONDS)
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+logger = logging.getLogger("medi_save_auto_forward")
 
 
-def init_db(db_path: str) -> None:
-    with db_connect(db_path) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS media_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                media_type TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_media_user ON media_messages(user_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen_at)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS banned_users (
-                user_id INTEGER PRIMARY KEY,
-                banned_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
+class Base(DeclarativeBase):
+    pass
 
 
-def upsert_user(db_path: str, tg_user) -> None:
-    now = utc_now_iso()
-    with db_connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO users(user_id, username, first_name, last_name, joined_at, last_seen_at)
-            VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first_name=excluded.first_name,
-                last_name=excluded.last_name,
-                last_seen_at=excluded.last_seen_at
-            """,
-            (
-                tg_user.id,
-                tg_user.username,
-                tg_user.first_name,
-                tg_user.last_name,
-                now,
-                now,
-            ),
-        )
-        conn.commit()
+class QueueStatus(str, Enum):
+    pending = "pending"
+    sending = "sending"
+    sent = "sent"
+    failed = "failed"
 
 
-def store_media_message(db_path: str, user_id: int, message_id: int, media_type: str) -> None:
-    with db_connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO media_messages(user_id, message_id, media_type, created_at)
-            VALUES(?, ?, ?, ?)
-            """,
-            (user_id, message_id, media_type, utc_now_iso()),
-        )
-        conn.commit()
+class DeliveryStatus(str, Enum):
+    pending = "pending"
+    sent = "sent"
+    failed = "failed"
+    skipped = "skipped"
 
 
-def get_total_users(db_path: str) -> int:
-    with db_connect(db_path) as conn:
-        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
-        return int(row[0] if row else 0)
+class Destination(Base):
+    __tablename__ = "destinations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
-def get_total_media(db_path: str) -> int:
-    with db_connect(db_path) as conn:
-        row = conn.execute("SELECT COUNT(*) FROM media_messages").fetchone()
-        return int(row[0] if row else 0)
+class QueueItem(Base):
+    __tablename__ = "queue_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_message_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True, index=True)
+    media_group_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    file_unique_id: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    file_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    file_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    file_size: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[QueueStatus] = mapped_column(SqlEnum(QueueStatus), default=QueueStatus.pending, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    deliveries: Mapped[list["Delivery"]] = relationship(back_populates="queue_item", cascade="all, delete-orphan")
 
 
-def get_users_page(db_path: str, page: int, page_size: int) -> list[tuple]:
-    offset = page * page_size
-    with db_connect(db_path) as conn:
-        return conn.execute(
-            """
-            SELECT user_id, username, first_name, last_name
-            FROM users
-            ORDER BY last_seen_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            (page_size, offset),
-        ).fetchall()
+class Delivery(Base):
+    __tablename__ = "deliveries"
+    __table_args__ = (UniqueConstraint("queue_item_id", "destination_id", name="uq_delivery_queue_destination"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    queue_item_id: Mapped[int] = mapped_column(ForeignKey("queue_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    destination_id: Mapped[int] = mapped_column(ForeignKey("destinations.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[DeliveryStatus] = mapped_column(SqlEnum(DeliveryStatus), default=DeliveryStatus.pending, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    queue_item: Mapped[QueueItem] = relationship(back_populates="deliveries")
 
 
-def get_user_count(db_path: str) -> int:
-    return get_total_users(db_path)
+class RuntimeSetting(Base):
+    __tablename__ = "runtime_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    delay_seconds: Mapped[float] = mapped_column(default=1.0, nullable=False)
+    max_file_size_mb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    caption_prefix: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    auto_delete_saved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    duplicate_protection: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
-def get_all_user_ids(db_path: str) -> list[int]:
-    with db_connect(db_path) as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-        return [int(r[0]) for r in rows]
+class Database:
+    def __init__(self, settings: Settings) -> None:
+        self.engine: AsyncEngine = create_async_engine(settings.database_url, future=True, pool_pre_ping=True)
+        self.session_factory = async_sessionmaker(bind=self.engine, expire_on_commit=False, autoflush=False, class_=AsyncSession)
+
+    async def create_schema(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def dispose(self) -> None:
+        await self.engine.dispose()
+
+    @contextlib.asynccontextmanager
+    async def session(self) -> AsyncSession:
+        async with self.session_factory() as session:
+            yield session
 
 
-def get_user_media(db_path: str, user_id: int, limit: int = 10) -> list[tuple]:
-    with db_connect(db_path) as conn:
-        return conn.execute(
-            """
-            SELECT message_id, media_type, created_at
-            FROM media_messages
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
+@dataclass(slots=True)
+class MediaPayload:
+    source_chat_id: int
+    source_message_id: int
+    media_group_id: Optional[str]
+    file_unique_id: Optional[str]
+    file_id: Optional[str]
+    file_type: str
+    caption: Optional[str]
+    file_size: Optional[int]
 
+class Repository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
 
-def get_active_user_count(db_path: str, days: int = 7) -> int:
-    with db_connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM users
-            WHERE datetime(last_seen_at) >= datetime('now', ?)
-            """,
-            (f"-{days} days",),
-        ).fetchone()
-        return int(row[0] if row else 0)
+    async def ensure_runtime_settings(self) -> RuntimeSetting:
+        row = await self.session.get(RuntimeSetting, 1)
+        if row:
+            return row
+        row = RuntimeSetting(id=1)
+        self.session.add(row)
+        await self.session.commit()
+        return row
 
+    async def get_runtime_settings(self) -> RuntimeSetting:
+        row = await self.session.get(RuntimeSetting, 1)
+        return row if row else await self.ensure_runtime_settings()
 
-def ban_user(db_path: str, user_id: int) -> None:
-    with db_connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO banned_users(user_id, banned_at)
-            VALUES(?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET banned_at=excluded.banned_at
-            """,
-            (user_id, utc_now_iso()),
-        )
-        conn.commit()
+    async def add_destination(self, chat_id: int) -> Destination:
+        row = await self.session.scalar(select(Destination).where(Destination.chat_id == chat_id))
+        if row:
+            row.is_enabled = True
+            await self.session.commit()
+            return row
+        row = Destination(chat_id=chat_id, is_enabled=True)
+        self.session.add(row)
+        await self.session.commit()
+        return row
 
+    async def disable_destination(self, chat_id: int) -> bool:
+        result = await self.session.execute(update(Destination).where(Destination.chat_id == chat_id).values(is_enabled=False))
+        await self.session.commit()
+        return (result.rowcount or 0) > 0
 
-def unban_user(db_path: str, user_id: int) -> None:
-    with db_connect(db_path) as conn:
-        conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
-        conn.commit()
+    async def list_destinations(self) -> list[Destination]:
+        rows = await self.session.scalars(select(Destination).order_by(Destination.id.asc()))
+        return list(rows)
 
-
-def is_banned(db_path: str, user_id: int) -> bool:
-    with db_connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1", (user_id,)
-        ).fetchone()
-        return bool(row)
-
-
-def display_name(username: str | None, first_name: str | None, last_name: str | None) -> str:
-    if username:
-        return f"@{username}"
-    full_name = " ".join(x for x in [first_name, last_name] if x).strip()
-    return full_name or "Unknown User"
-
-
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📢 Broadcast", callback_data=f"{ADMIN_MENU_PREFIX}broadcast"),
-                InlineKeyboardButton("👥 Total Users", callback_data=f"{ADMIN_MENU_PREFIX}total_users"),
-            ],
-            [
-                InlineKeyboardButton("🖼️ Total Media", callback_data=f"{ADMIN_MENU_PREFIX}total_media"),
-                InlineKeyboardButton("📋 Users", callback_data=f"{ADMIN_MENU_PREFIX}users:0"),
-            ],
-            [
-                InlineKeyboardButton("📈 Weekly Active", callback_data=f"{ADMIN_MENU_PREFIX}active_users"),
-            ],
-        ]
-    )
-
-
-def users_keyboard(db_path: str, page: int) -> InlineKeyboardMarkup:
-    users = get_users_page(db_path, page=page, page_size=USER_PAGE_SIZE)
-    total_users = get_user_count(db_path)
-    rows: list[list[InlineKeyboardButton]] = []
-
-    for user_id, username, first_name, last_name in users:
-        name = display_name(username, first_name, last_name)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{name} ({user_id})",
-                    callback_data=f"{ADMIN_MENU_PREFIX}user:{user_id}",
+    async def enqueue_media(self, payload: MediaPayload, skip_if_duplicate: bool = True) -> Optional[QueueItem]:
+        if skip_if_duplicate and payload.file_unique_id:
+            duplicate = await self.session.scalar(
+                select(QueueItem).where(
+                    QueueItem.file_unique_id == payload.file_unique_id,
+                    QueueItem.status.in_([QueueStatus.pending, QueueStatus.sending, QueueStatus.sent]),
                 )
-            ]
+            )
+            if duplicate:
+                return None
+
+        existing = await self.session.scalar(select(QueueItem).where(QueueItem.source_message_id == payload.source_message_id))
+        if existing:
+            return None
+
+        dests = list(await self.session.scalars(select(Destination).where(Destination.is_enabled.is_(True))))
+        if not dests:
+            return None
+
+        item = QueueItem(
+            source_chat_id=payload.source_chat_id,
+            source_message_id=payload.source_message_id,
+            media_group_id=payload.media_group_id,
+            file_unique_id=payload.file_unique_id,
+            file_id=payload.file_id,
+            file_type=payload.file_type,
+            caption=payload.caption,
+            file_size=payload.file_size,
+            status=QueueStatus.pending,
         )
+        self.session.add(item)
+        await self.session.flush()
+        for d in dests:
+            self.session.add(Delivery(queue_item_id=item.id, destination_id=d.id, status=DeliveryStatus.pending))
 
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"{ADMIN_MENU_PREFIX}users:{page - 1}")
-        )
-    if (page + 1) * USER_PAGE_SIZE < total_users:
-        nav_row.append(
-            InlineKeyboardButton("Next ➡️", callback_data=f"{ADMIN_MENU_PREFIX}users:{page + 1}")
-        )
-    if nav_row:
-        rows.append(nav_row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def get_media_type(message) -> str | None:
-    if message.photo:
-        return "photo"
-    for media_type in MEDIA_TYPES - {"photo"}:
-        if getattr(message, media_type, None):
-            return media_type
-    return None
-
-
-def is_admin(update: Update, admin_user_id: int) -> bool:
-    return bool(update.effective_user and update.effective_user.id == admin_user_id)
-
-
-def prune_pending_media_groups(context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-    if not pending_groups:
-        return
-
-    now = time.time()
-    expired_keys = [
-        key
-        for key, group in pending_groups.items()
-        if now - float(group.get("last_updated_at", now)) > PENDING_MEDIA_GROUP_TTL_SECONDS
-    ]
-    for key in expired_keys:
-        group = pending_groups.pop(key, None)
-        if group and group.get("task"):
-            group["task"].cancel()
-
-    if len(pending_groups) <= MAX_PENDING_MEDIA_GROUPS:
-        return
-
-    overflow = len(pending_groups) - MAX_PENDING_MEDIA_GROUPS
-    oldest = sorted(
-        pending_groups.items(),
-        key=lambda item: float(item[1].get("created_at", now)),
-    )[:overflow]
-    for key, group in oldest:
-        pending_groups.pop(key, None)
-        if group.get("task"):
-            group["task"].cancel()
-
-
-async def flush_media_group(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str
-) -> None:
-    key = (chat_id, media_group_id)
-    pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-    group_data = pending_groups.pop(key, None)
-    if not group_data:
-        return
-
-    message_ids = sorted(group_data["message_ids"])
-    try:
-        # copy_messages keeps album behavior and anonymity.
-        await context.bot.copy_messages(
-            chat_id=chat_id,
-            from_chat_id=chat_id,
-            message_ids=message_ids,
-        )
-        return
-    except Exception as exc:
-        logger.warning(
-            "Album copy failed for chat_id=%s media_group_id=%s: %s",
-            chat_id,
-            media_group_id,
-            exc,
-        )
-
-    # Fallback: copy one by one if grouped copy fails.
-    for message_id in message_ids:
         try:
-            await context.bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=chat_id,
-                message_id=message_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Fallback copy failed for chat_id=%s message_id=%s: %s",
-                chat_id,
-                message_id,
-                exc,
-            )
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
+            return None
+        return item
 
-
-async def schedule_media_group_flush(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str
-) -> None:
-    await asyncio.sleep(1.6)  # debounce
-    await flush_media_group(context, chat_id, media_group_id)
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if isinstance(context.error, Conflict):
-        logger.warning(
-            "Telegram getUpdates conflict detected. "
-            "Another instance is polling with the same bot token."
+    async def fetch_next_item(self) -> Optional[QueueItem]:
+        item = await self.session.scalar(
+            select(QueueItem)
+            .where(QueueItem.status.in_([QueueStatus.pending, QueueStatus.failed]))
+            .order_by(QueueItem.created_at.asc())
+            .limit(1)
         )
-        return
-    logger.exception("Unhandled error while processing update: %s", context.error)
+        if not item:
+            return None
+        full = await self.session.scalar(
+            select(QueueItem).where(QueueItem.id == item.id).options(selectinload(QueueItem.deliveries))
+        )
+        if not full:
+            return None
+        full.status = QueueStatus.sending
+        await self.session.commit()
+        return full
 
+    async def refresh_item(self, item_id: int) -> Optional[QueueItem]:
+        return await self.session.scalar(select(QueueItem).where(QueueItem.id == item_id).options(selectinload(QueueItem.deliveries)))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        upsert_user(context.bot_data["db_path"], update.effective_user)
-        if is_admin(update, context.bot_data["admin_user_id"]):
-            await update.message.reply_text(
-                "👋 Welcome Admin.\nClick the button below to open admin controls.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🛠️ Admin Panel",
-                                callback_data=f"{ADMIN_MENU_PREFIX}open_panel",
-                            )
-                        ]
-                    ]
-                ),
-            )
+    async def increment_attempt(self, item_id: int, error: str) -> None:
+        row = await self.session.get(QueueItem, item_id)
+        if not row:
             return
-        await update.message.reply_text(WELCOME_TEXT)
+        row.attempts += 1
+        row.error_text = error
+        await self.session.commit()
 
+    async def update_delivery(self, delivery_id: int, status: DeliveryStatus, error_text: Optional[str] = None) -> None:
+        values = {"status": status, "error_text": error_text}
+        if status == DeliveryStatus.sent:
+            values["sent_at"] = datetime.now(timezone.utc)
+        await self.session.execute(update(Delivery).where(Delivery.id == delivery_id).values(**values))
+        await self.session.commit()
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        if update.message:
-            await update.message.reply_text("❌ You are not allowed to access admin panel.")
-        return
-    if update.message:
-        await update.message.reply_text(ADMIN_TEXT, reply_markup=admin_menu_keyboard())
-
-
-async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        await query.answer("Not allowed.", show_alert=True)
-        return
-
-    await query.answer()
-    data = query.data or ""
-    db_path = context.bot_data["db_path"]
-
-    if data in {
-        f"{ADMIN_MENU_PREFIX}back",
-        f"{ADMIN_MENU_PREFIX}open_panel",
-    }:
-        await query.edit_message_text(ADMIN_TEXT, reply_markup=admin_menu_keyboard())
-        return
-
-    if data == f"{ADMIN_MENU_PREFIX}broadcast":
-        context.user_data["awaiting_broadcast"] = True
-        await query.edit_message_text(
-            "📢 Send the message you want to broadcast to all users.\n"
-            "You can send text or media with caption.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
-
-    if data == f"{ADMIN_MENU_PREFIX}total_users":
-        total = get_total_users(db_path)
-        await query.edit_message_text(
-            f"👥 Total users: {total}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
-
-    if data == f"{ADMIN_MENU_PREFIX}total_media":
-        total = get_total_media(db_path)
-        await query.edit_message_text(
-            f"🖼️ Total media sent: {total}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
-
-    if data == f"{ADMIN_MENU_PREFIX}active_users":
-        total = get_total_users(db_path)
-        active = get_active_user_count(db_path, days=7)
-        inactive = max(total - active, 0)
-        await query.edit_message_text(
-            f"📈 Last 7 days\nActive users: {active}\nInactive users: {inactive}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
-
-    if data.startswith(f"{ADMIN_MENU_PREFIX}users:"):
-        page = int(data.split(":")[-1])
-        await query.edit_message_text(
-            "📋 Users list:",
-            reply_markup=users_keyboard(db_path, page),
-        )
-        return
-
-    if data.startswith(f"{ADMIN_MENU_PREFIX}user:"):
-        user_id = int(data.split(":")[-1])
-        media_records = get_user_media(db_path, user_id=user_id, limit=10)
-        if not media_records:
-            await query.message.reply_text(f"ℹ️ User {user_id} has no media records.")
+    async def finalize_item(self, row: QueueItem, max_retries: int) -> QueueItem:
+        sent = sum(1 for d in row.deliveries if d.status == DeliveryStatus.sent)
+        failed = sum(1 for d in row.deliveries if d.status == DeliveryStatus.failed)
+        if row.deliveries and sent == len(row.deliveries):
+            row.status = QueueStatus.sent
+            row.sent_at = datetime.now(timezone.utc)
+            row.error_text = None
+        elif row.attempts >= max_retries or failed > 0:
+            row.status = QueueStatus.failed
         else:
-            await query.message.reply_text(
-                f"🗂️ Last {len(media_records)} media messages from user {user_id}:"
-            )
-            for message_id, media_type, created_at in media_records:
-                try:
-                    await context.bot.copy_message(
-                        chat_id=admin_user_id,
-                        from_chat_id=user_id,
-                        message_id=message_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to copy media message_id=%s from user_id=%s: %s",
-                        message_id,
-                        user_id,
-                        exc,
-                    )
-                    await query.message.reply_text(
-                        f"⚠️ Failed: {media_type} ({message_id}) at {created_at}"
-                    )
-        await query.message.reply_text("🛠️ Admin Panel", reply_markup=admin_menu_keyboard())
-        return
+            row.status = QueueStatus.pending
+        await self.session.commit()
+        return row
+
+    async def stats(self) -> dict[str, int]:
+        total = await self.session.scalar(select(func.count(QueueItem.id)))
+        pending = await self.session.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == QueueStatus.pending))
+        sent = await self.session.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == QueueStatus.sent))
+        failed = await self.session.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == QueueStatus.failed))
+        size = await self.session.scalar(select(func.coalesce(func.sum(QueueItem.file_size), 0)))
+        return {
+            "total": int(total or 0),
+            "pending": int(pending or 0),
+            "sent": int(sent or 0),
+            "failed": int(failed or 0),
+            "size": int(size or 0),
+        }
+
+    async def clear_queue(self) -> int:
+        result = await self.session.execute(delete(QueueItem))
+        await self.session.commit()
+        return int(result.rowcount or 0)
 
 
-def parse_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
-    if context.args:
-        candidate = context.args[0].strip()
-        if candidate.lstrip("-").isdigit():
-            return int(candidate)
-    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
-        return update.message.reply_to_message.from_user.id
+def extract_media_payload(message: Message) -> Optional[dict[str, object]]:
+    if message.photo:
+        return {"file_type": "photo", "file_id": message.photo.file_id, "file_unique_id": message.photo.file_unique_id, "file_size": message.photo.file_size}
+    if message.video:
+        return {"file_type": "video", "file_id": message.video.file_id, "file_unique_id": message.video.file_unique_id, "file_size": message.video.file_size}
+    if message.document:
+        return {"file_type": "document", "file_id": message.document.file_id, "file_unique_id": message.document.file_unique_id, "file_size": message.document.file_size}
+    if message.audio:
+        return {"file_type": "audio", "file_id": message.audio.file_id, "file_unique_id": message.audio.file_unique_id, "file_size": message.audio.file_size}
     return None
 
-
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update, context.bot_data["admin_user_id"]):
-        await update.message.reply_text("❌ You are not allowed to use this command.")
-        return
-
-    target_user_id = parse_target_user_id(update, context)
-    if target_user_id is None:
-        await update.message.reply_text("Usage: /ban <user_id> or reply to a user message with /ban")
-        return
-    if target_user_id == context.bot_data["admin_user_id"]:
-        await update.message.reply_text("⚠️ You cannot ban yourself.")
-        return
-
-    ban_user(context.bot_data["db_path"], target_user_id)
-    await update.message.reply_text(f"🚫 User {target_user_id} has been banned.")
+@dataclass(slots=True)
+class AlbumBucket:
+    messages: List[Message]
+    flush_task: asyncio.Task[None]
 
 
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update, context.bot_data["admin_user_id"]):
-        await update.message.reply_text("❌ You are not allowed to use this command.")
-        return
+class SavedMessagesListener:
+    def __init__(self, user_client: Client, db: Database, settings: Settings) -> None:
+        self.user_client = user_client
+        self.db = db
+        self.settings = settings
+        self.album_buckets: Dict[str, AlbumBucket] = {}
+        self.album_lock = asyncio.Lock()
 
-    target_user_id = parse_target_user_id(update, context)
-    if target_user_id is None:
-        await update.message.reply_text("Usage: /unban <user_id> or reply to a user message with /unban")
-        return
+    def register_handlers(self) -> None:
+        @self.user_client.on_message(filters.chat("me") & (filters.photo | filters.video | filters.document | filters.audio))
+        async def _on_media(_: Client, message: Message) -> None:
+            await self.handle_message(message)
 
-    unban_user(context.bot_data["db_path"], target_user_id)
-    await update.message.reply_text(f"✅ User {target_user_id} has been unbanned.")
+    async def handle_message(self, message: Message) -> None:
+        if message.media_group_id:
+            await self.buffer_album(str(message.media_group_id), message)
+            return
+        await self.enqueue_message(message)
 
+    async def buffer_album(self, media_group_id: str, message: Message) -> None:
+        async with self.album_lock:
+            bucket = self.album_buckets.get(media_group_id)
+            if bucket:
+                bucket.messages.append(message)
+                if not bucket.flush_task.done():
+                    bucket.flush_task.cancel()
+            else:
+                bucket = AlbumBucket(messages=[message], flush_task=asyncio.create_task(asyncio.sleep(0)))
+            bucket.flush_task = asyncio.create_task(self.flush_album(media_group_id))
+            self.album_buckets[media_group_id] = bucket
 
-async def broadcast_to_user(
-    context: ContextTypes.DEFAULT_TYPE,
-    sem: asyncio.Semaphore,
-    admin_user_id: int,
-    source_message_id: int,
-    user_id: int,
-) -> bool:
-    async with sem:
+    async def flush_album(self, media_group_id: str) -> None:
         try:
-            await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=admin_user_id,
-                message_id=source_message_id,
+            await asyncio.sleep(self.settings.album_flush_seconds)
+            async with self.album_lock:
+                bucket = self.album_buckets.pop(media_group_id, None)
+            if not bucket:
+                return
+            for message in sorted(bucket.messages, key=lambda m: m.id):
+                await self.enqueue_message(message)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Album flush failed: %s", media_group_id)
+
+    async def enqueue_message(self, message: Message) -> None:
+        media = extract_media_payload(message)
+        if not media:
+            return
+        async with self.db.session() as session:
+            repo = Repository(session)
+            settings = await repo.get_runtime_settings()
+            if not settings.is_enabled:
+                return
+            if settings.max_file_size_mb > 0:
+                limit = settings.max_file_size_mb * 1024 * 1024
+                if media["file_size"] and int(media["file_size"]) > limit:
+                    return
+
+            payload = MediaPayload(
+                source_chat_id=message.chat.id,
+                source_message_id=message.id,
+                media_group_id=str(message.media_group_id) if message.media_group_id else None,
+                file_unique_id=str(media["file_unique_id"]) if media["file_unique_id"] else None,
+                file_id=str(media["file_id"]) if media["file_id"] else None,
+                file_type=str(media["file_type"]),
+                caption=message.caption,
+                file_size=int(media["file_size"]) if media["file_size"] else None,
             )
-            return True
-        except RetryAfter as exc:
-            await asyncio.sleep(float(exc.retry_after))
+            await repo.enqueue_media(payload, skip_if_duplicate=settings.duplicate_protection)
+
+
+class QueueWorker:
+    def __init__(self, user_client: Client, db: Database, settings: Settings) -> None:
+        self.user_client = user_client
+        self.db = db
+        self.settings = settings
+        self.stop_event = asyncio.Event()
+
+    async def run(self) -> None:
+        while not self.stop_event.is_set():
             try:
-                await context.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=admin_user_id,
-                    message_id=source_message_id,
-                )
-                return True
-            except Exception as retry_exc:
-                logger.warning("Broadcast retry failed to user_id=%s: %s", user_id, retry_exc)
-                return False
-        except (Forbidden, BadRequest) as exc:
-            logger.warning("Broadcast blocked for user_id=%s: %s", user_id, exc)
-            return False
+                async with self.db.session() as session:
+                    repo = Repository(session)
+                    runtime = await repo.get_runtime_settings()
+                    if not runtime.is_enabled:
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+
+                    item = await repo.fetch_next_item()
+                    if not item:
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+
+                    destinations = list(await session.scalars(select(Destination).where(Destination.is_enabled.is_(True))))
+                    for delivery, dest in zip(item.deliveries, destinations):
+                        if delivery.status == DeliveryStatus.sent:
+                            continue
+                        caption = item.caption
+                        if runtime.caption_prefix:
+                            caption = f"{runtime.caption_prefix}\n\n{item.caption}" if item.caption else runtime.caption_prefix
+                        await asyncio.sleep(max(0.0, runtime.delay_seconds))
+                        await self.send_one(repo, item.id, delivery.id, item.source_chat_id, item.source_message_id, dest.chat_id, caption)
+
+                    fresh = await repo.refresh_item(item.id)
+                    if not fresh:
+                        continue
+                    done = await repo.finalize_item(fresh, self.settings.max_retries)
+                    if done.status == QueueStatus.sent and runtime.auto_delete_saved:
+                        with contextlib.suppress(Exception):
+                            await self.user_client.delete_messages("me", done.source_message_id)
+            except Exception:
+                logger.exception("Worker loop failed")
+                await asyncio.sleep(self.settings.poll_interval_seconds)
+
+    async def send_one(self, repo: Repository, item_id: int, delivery_id: int, from_chat: int, msg_id: int, to_chat: int, caption: Optional[str]) -> None:
+        try:
+            await self.user_client.copy_message(chat_id=to_chat, from_chat_id=from_chat, message_id=msg_id, caption=caption)
+            await repo.update_delivery(delivery_id, DeliveryStatus.sent)
+        except FloodWait as exc:
+            await repo.update_delivery(delivery_id, DeliveryStatus.failed, f"FloodWait({exc.value})")
+            await repo.increment_attempt(item_id, f"FloodWait({exc.value})")
+            await asyncio.sleep(exc.value + 1)
+        except RPCError as exc:
+            await repo.update_delivery(delivery_id, DeliveryStatus.failed, str(exc))
+            await repo.increment_attempt(item_id, str(exc))
         except Exception as exc:
-            logger.warning("Broadcast failed to user_id=%s: %s", user_id, exc)
+            await repo.update_delivery(delivery_id, DeliveryStatus.failed, str(exc))
+            await repo.increment_attempt(item_id, str(exc))
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+
+
+def register_admin_handlers(bot_client: Client, db: Database, admin_ids: set[int]) -> None:
+    async def guard(message: Message) -> bool:
+        uid = message.from_user.id if message.from_user else None
+        if uid not in admin_ids:
+            await message.reply_text("Unauthorized.")
             return False
+        return True
 
-
-async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        return
-    if not context.user_data.get("awaiting_broadcast"):
-        return
-
-    context.user_data["awaiting_broadcast"] = False
-    db_path = context.bot_data["db_path"]
-    users = get_all_user_ids(db_path)
-    sem = asyncio.Semaphore(max(1, BROADCAST_CONCURRENCY))
-
-    results = await asyncio.gather(
-        *[
-            broadcast_to_user(
-                context=context,
-                sem=sem,
-                admin_user_id=admin_user_id,
-                source_message_id=update.message.message_id,
-                user_id=user_id,
-            )
-            for user_id in users
-        ],
-        return_exceptions=False,
-    )
-    success = sum(1 for x in results if x)
-    failed = len(results) - success
-
-    await update.message.reply_text(
-        f"✅ Broadcast finished.\nDelivered: {success}\nFailed: {failed}",
-        reply_markup=admin_menu_keyboard(),
-    )
-
-
-async def anonymous_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-    user_id = update.effective_user.id
-
-    if is_banned(context.bot_data["db_path"], user_id):
-        return
-
-    cooldown = context.application.bot_data.setdefault("user_cooldown", {})
-    now_ts = time.time()
-    last_seen_ts = float(cooldown.get(user_id, 0.0))
-    if now_ts - last_seen_ts < USER_COOLDOWN_SECONDS:
-        return
-    cooldown[user_id] = now_ts
-
-    upsert_user(context.bot_data["db_path"], update.effective_user)
-    media_type = get_media_type(update.message)
-    if media_type:
-        store_media_message(
-            context.bot_data["db_path"],
-            user_id=user_id,
-            message_id=update.message.message_id,
-            media_type=media_type,
+    @bot_client.on_message(filters.command(["start", "help"]))
+    async def help_cmd(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        await message.reply_text(
+            "Commands:\n"
+            "/enable | /disable\n"
+            "/setdelay <seconds>\n"
+            "/setmaxsize <mb>\n"
+            "/setprefix <text> | /setprefix off\n"
+            "/autodelete on|off\n"
+            "/dupe on|off\n"
+            "/adddest <chat_id>\n"
+            "/removedest <chat_id>\n"
+            "/listdest\n"
+            "/stats\n"
+            "/clearqueue"
         )
 
-    media_group_id = update.message.media_group_id
-    now_ts = time.time()
+    @bot_client.on_message(filters.command("enable"))
+    async def enable_cmd(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.is_enabled = True
+            await session.commit()
+        await message.reply_text("Enabled.")
 
-    if media_group_id:
-        prune_pending_media_groups(context)
-        pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-        key = (chat_id, str(media_group_id))
+    @bot_client.on_message(filters.command("disable"))
+    async def disable_cmd(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.is_enabled = False
+            await session.commit()
+        await message.reply_text("Disabled.")
 
-        existing = pending_groups.get(key)
-        if existing and existing.get("task"):
-            existing["task"].cancel()
+    @bot_client.on_message(filters.command("setdelay"))
+    async def set_delay(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /setdelay <seconds>")
+            return
+        try:
+            delay = float(message.command[1])
+            if delay < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply_text("Invalid delay")
+            return
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.delay_seconds = delay
+            await session.commit()
+        await message.reply_text(f"Delay updated: {delay}s")
 
-        task = asyncio.create_task(
-            schedule_media_group_flush(context, chat_id, str(media_group_id))
-        )
-        if key not in pending_groups:
-            pending_groups[key] = {
-                "message_ids": [],
-                "task": task,
-                "created_at": now_ts,
-                "last_updated_at": now_ts,
-            }
-        else:
-            pending_groups[key]["task"] = task
+    @bot_client.on_message(filters.command("setmaxsize"))
+    async def set_max(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /setmaxsize <mb>")
+            return
+        try:
+            mb = int(message.command[1])
+            if mb < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply_text("Invalid mb")
+            return
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.max_file_size_mb = mb
+            await session.commit()
+        await message.reply_text(f"Max size updated: {mb}MB")
 
-        pending_groups[key]["message_ids"].append(update.message.message_id)
-        pending_groups[key]["last_updated_at"] = now_ts
-        return
+    @bot_client.on_message(filters.command("setprefix"))
+    async def set_prefix(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /setprefix <text> | /setprefix off")
+            return
+        content = message.text.split(maxsplit=1)[1].strip() if message.text else ""
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.caption_prefix = None if content.lower() == "off" else content
+            await session.commit()
+        await message.reply_text("Prefix updated.")
 
-    # cooldown must be AFTER album handling
-    cooldown = context.application.bot_data.setdefault("user_cooldown", {})
-    last_seen_ts = float(cooldown.get(user_id, 0.0))
-    if now_ts - last_seen_ts < USER_COOLDOWN_SECONDS:
-        return
-    cooldown[user_id] = now_ts
+    @bot_client.on_message(filters.command("autodelete"))
+    async def set_autodel(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2 or message.command[1].lower() not in {"on", "off"}:
+            await message.reply_text("Usage: /autodelete on|off")
+            return
+        on = message.command[1].lower() == "on"
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.auto_delete_saved = on
+            await session.commit()
+        await message.reply_text(f"Auto delete: {'ON' if on else 'OFF'}")
+
+    @bot_client.on_message(filters.command("dupe"))
+    async def set_dupe(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2 or message.command[1].lower() not in {"on", "off"}:
+            await message.reply_text("Usage: /dupe on|off")
+            return
+        on = message.command[1].lower() == "on"
+        async with db.session() as session:
+            repo = Repository(session)
+            row = await repo.get_runtime_settings()
+            row.duplicate_protection = on
+            await session.commit()
+        await message.reply_text(f"Duplicate protection: {'ON' if on else 'OFF'}")
+
+    @bot_client.on_message(filters.command("adddest"))
+    async def add_dest(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /adddest <chat_id>")
+            return
+        try:
+            chat_id = int(message.command[1])
+        except ValueError:
+            await message.reply_text("chat_id must be integer")
+            return
+        async with db.session() as session:
+            await Repository(session).add_destination(chat_id)
+        await message.reply_text("Destination added.")
+
+    @bot_client.on_message(filters.command("removedest"))
+    async def remove_dest(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /removedest <chat_id>")
+            return
+        try:
+            chat_id = int(message.command[1])
+        except ValueError:
+            await message.reply_text("chat_id must be integer")
+            return
+        async with db.session() as session:
+            ok = await Repository(session).disable_destination(chat_id)
+        await message.reply_text("Destination disabled." if ok else "Destination not found.")
+
+    @bot_client.on_message(filters.command("listdest"))
+    async def list_dest(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        async with db.session() as session:
+            rows = await Repository(session).list_destinations()
+        if not rows:
+            await message.reply_text("No destinations.")
+            return
+        await message.reply_text("\n".join([f"{r.chat_id} [{'on' if r.is_enabled else 'off'}]" for r in rows]))
+
+    @bot_client.on_message(filters.command("stats"))
+    async def stats(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        async with db.session() as session:
+            s = await Repository(session).stats()
+        await message.reply_text(f"Total={s['total']} Pending={s['pending']} Sent={s['sent']} Failed={s['failed']} Size={s['size']} bytes")
+
+    @bot_client.on_message(filters.command("clearqueue"))
+    async def clear_queue(_: Client, message: Message) -> None:
+        if not await guard(message):
+            return
+        async with db.session() as session:
+            c = await Repository(session).clear_queue()
+        await message.reply_text(f"Queue cleared: {c} rows")
 
 
-    # copy_message keeps it anonymous. If Telegram rejects copy for a media type,
-    # fall back to sending the same media by file_id.
+async def run() -> None:
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    db = Database(settings)
+    await db.create_schema()
+    async with db.session() as session:
+        await Repository(session).ensure_runtime_settings()
+
+    user_client = Client(name=settings.user_session_name, api_id=settings.api_id, api_hash=settings.api_hash)
+    user_client = Client(
+        name="user_session",
+        api_id=settings.api_id,
+        api_hash=settings.api_hash,
+        session_string=os.getenv("SESSION_STRING")
+    )
+
+    listener = SavedMessagesListener(user_client, db, settings)
+    listener.register_handlers()
+    register_admin_handlers(bot_client, db, set(settings.admin_ids))
+    worker = QueueWorker(user_client, db, settings)
+
+    stop_event = asyncio.Event()
+
+    def stop_handler() -> None:
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop_handler)
+
+    await user_client.start()
+    await bot_client.start()
+    worker_task = asyncio.create_task(worker.run())
+    logger.info("medi_save_auto_forward started")
+
     try:
-        await update.message.copy(chat_id=chat_id)
-        return
-    except Exception as exc:
-        logger.warning("Anonymous copy failed for message_id=%s: %s", update.message.message_id, exc)
-
-    msg = update.message
-    if msg.text:
-        await context.bot.send_message(chat_id=chat_id, text=msg.text)
-    elif msg.photo:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=msg.photo[-1].file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-        )
-    elif msg.video:
-        await context.bot.send_video(
-            chat_id=chat_id,
-            video=msg.video.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-        )
-    elif msg.document:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=msg.document.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-        )
-    elif msg.voice:
-        await context.bot.send_voice(chat_id=chat_id, voice=msg.voice.file_id, caption=msg.caption)
-    elif msg.audio:
-        await context.bot.send_audio(
-            chat_id=chat_id,
-            audio=msg.audio.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-        )
-    elif msg.sticker:
-        await context.bot.send_sticker(chat_id=chat_id, sticker=msg.sticker.file_id)
-    elif msg.animation:
-        await context.bot.send_animation(
-            chat_id=chat_id,
-            animation=msg.animation.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-        )
-    elif msg.video_note:
-        await context.bot.send_video_note(chat_id=chat_id, video_note=msg.video_note.file_id)
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ I received your message, but this media type is not supported for anonymous echo yet.",
-        )
-
-
-async def main_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if (
-        context.user_data.get("awaiting_broadcast")
-        and is_admin(update, context.bot_data["admin_user_id"])
-    ):
-        await handle_broadcast_input(update, context)
-        return
-    await anonymous_forward(update, context)
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
-
-def run_server():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
-
-threading.Thread(target=run_server, daemon=True).start()
-
-def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    admin_user_id_raw = os.getenv("ADMIN_USER_ID")
-    if not token:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN environment variable. "
-            "Set it before running the bot."
-        )
-    if not admin_user_id_raw:
-        raise RuntimeError(
-            "Missing ADMIN_USER_ID environment variable. "
-            "Set it to your Telegram numeric user ID."
-        )
-    admin_user_id = int(admin_user_id_raw)
-    init_db(DB_PATH)
-
-    application = Application.builder().token(token).build()
-    application.bot_data["db_path"] = DB_PATH
-    application.bot_data["admin_user_id"] = admin_user_id
-    application.add_error_handler(on_error)
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("ban", ban_command))
-    application.add_handler(CommandHandler("unban", unban_command))
-    application.add_handler(
-        CallbackQueryHandler(admin_callbacks, pattern=f"^{ADMIN_MENU_PREFIX}")
-    )
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, main_message_handler))
-
-    startup_delay = int(os.getenv("STARTUP_DELAY_SECONDS", "0"))
-
-    logger.info("Bot is running...")
-    if startup_delay > 0:
-        logger.info("Startup delay enabled: waiting %s seconds before connecting to Telegram.", startup_delay)
-        time.sleep(startup_delay)
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+        await stop_event.wait()
+    finally:
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+        await bot_client.stop()
+        await user_client.stop()
+        await db.dispose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
