@@ -651,46 +651,46 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
     def main_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("\u26A1 Toggle", callback_data="ui:toggle"), InlineKeyboardButton("\U0001F504 Refresh", callback_data="ui:home")],
-                [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="ui:settings"), InlineKeyboardButton("\U0001F3AF Targets", callback_data="ui:targets")],
-                [InlineKeyboardButton("\U0001F4E6 Queue", callback_data="ui:queue"), InlineKeyboardButton("\U0001F465 Admins", callback_data="ui:admins")],
-                [InlineKeyboardButton("\U0001F310 Web Panel Link", callback_data="ui:webpanel")],
+                [InlineKeyboardButton("⚡ Toggle", callback_data="ui:toggle"), InlineKeyboardButton("🔄 Refresh", callback_data="ui:home")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="ui:settings"), InlineKeyboardButton("🎯 Targets", callback_data="ui:targets")],
+                [InlineKeyboardButton("📦 Queue", callback_data="ui:queue"), InlineKeyboardButton("👥 Admins", callback_data="ui:admins")],
+                [InlineKeyboardButton("🌐 Web Panel Link", callback_data="ui:webpanel")],
             ]
         )
 
     def settings_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("\u23F1\ufe0f Set Delay", callback_data="ui:set_delay"), InlineKeyboardButton("\U0001F4E6 Set Max Size", callback_data="ui:set_maxsize")],
-                [InlineKeyboardButton("\U0001F4DD Set Prefix", callback_data="ui:set_prefix"), InlineKeyboardButton("\U0001F9F9 Toggle AutoDelete", callback_data="ui:toggle_autodel")],
-                [InlineKeyboardButton("\U0001F6E1 Toggle Dupe Protection", callback_data="ui:toggle_dupe")],
-                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+                [InlineKeyboardButton("⏱️ Set Delay", callback_data="ui:set_delay"), InlineKeyboardButton("📦 Set Max Size", callback_data="ui:set_maxsize")],
+                [InlineKeyboardButton("📝 Set Prefix", callback_data="ui:set_prefix"), InlineKeyboardButton("🧹 Toggle AutoDelete", callback_data="ui:toggle_autodel")],
+                [InlineKeyboardButton("🛡️ Toggle Dupe Protection", callback_data="ui:toggle_dupe")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="ui:home")],
             ]
         )
 
     def targets_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("\u2795 Add Target", callback_data="ui:add_target"), InlineKeyboardButton("\u2796 Remove Target", callback_data="ui:remove_target")],
-                [InlineKeyboardButton("\U0001F4CB List Targets", callback_data="ui:list_targets")],
-                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+                [InlineKeyboardButton("➕ Add Target", callback_data="ui:add_target"), InlineKeyboardButton("➖ Remove Target", callback_data="ui:remove_target")],
+                [InlineKeyboardButton("📋 List Targets", callback_data="ui:list_targets")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="ui:home")],
             ]
         )
 
     def queue_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("\U0001F501 Retry Failed", callback_data="ui:retry_failed"), InlineKeyboardButton("\U0001F5D1 Clear Queue", callback_data="ui:clear_queue")],
-                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+                [InlineKeyboardButton("🔁 Retry Failed", callback_data="ui:retry_failed"), InlineKeyboardButton("🗑️ Clear Queue", callback_data="ui:clear_queue")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="ui:home")],
             ]
         )
 
     def admins_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("\u2795 Add/Update Admin", callback_data="ui:add_admin"), InlineKeyboardButton("\u2796 Remove Admin", callback_data="ui:remove_admin")],
-                [InlineKeyboardButton("\U0001F4CB List Admins", callback_data="ui:list_admins")],
-                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+                [InlineKeyboardButton("➕ Add/Update Admin", callback_data="ui:add_admin"), InlineKeyboardButton("➖ Remove Admin", callback_data="ui:remove_admin")],
+                [InlineKeyboardButton("📋 List Admins", callback_data="ui:list_admins")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="ui:home")],
             ]
         )
 
@@ -700,13 +700,13 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
 
     async def guard_user(user_id: Optional[int], min_role: AdminRole = AdminRole.admin) -> tuple[bool, Optional[AdminUser], str]:
         if user_id is None:
-            return False, None, "\U0001F6D1 Unauthorized"
+            return False, None, "🛑 Unauthorized"
         rec = await get_admin(user_id)
         if rec is None:
-            return False, None, "\U0001F6D1 Unauthorized"
+            return False, None, "🛑 Unauthorized"
         order = {AdminRole.viewer: 1, AdminRole.admin: 2, AdminRole.owner: 3}
         if order[rec.role] < order[min_role]:
-            return False, rec, "\U0001F6AB Permission denied"
+            return False, rec, "🚫 Permission denied"
         return True, rec, ""
 
     async def build_status_text() -> str:
@@ -715,13 +715,13 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
             runtime = await repo.get_runtime_settings()
             s = await repo.stats()
         return (
-            "\U0001F916 <b>Media Auto-Forward Control Center</b>\n"
-            f"Status: {'\u2705 Enabled' if runtime.is_enabled else '\u23f8\ufe0f Disabled'}\n"
-            f"\u23F1\ufe0f Delay: {runtime.delay_seconds}s | \U0001F4E6 Max: {runtime.max_file_size_mb}MB\n"
-            f"\U0001F4DD Prefix: {(runtime.caption_prefix or '(none)')}\n"
-            f"\U0001F9F9 AutoDelete: {'ON' if runtime.auto_delete_saved else 'OFF'} | \U0001F6E1 Dupe: {'ON' if runtime.duplicate_protection else 'OFF'}\n\n"
-            f"\U0001F4CA Total: {s['total']} | \u23F3 Pending: {s['pending']} | \u2705 Sent: {s['sent']} | \u274C Failed: {s['failed']}\n"
-            f"\U0001F465 Admins: {s['admins']} | \U0001F4BE Size: {s['size']} bytes"
+            "🤖 <b>Media Auto-Forward Control Center</b>\n"
+            f"Status: {'✅ Enabled' if runtime.is_enabled else '⏸️ Disabled'}\n"
+            f"⏱️ Delay: {runtime.delay_seconds}s | 📦 Max: {runtime.max_file_size_mb}MB\n"
+            f"📝 Prefix: {(runtime.caption_prefix or '(none)')}\n"
+            f"🧹 AutoDelete: {'ON' if runtime.auto_delete_saved else 'OFF'} | 🛡️ Dupe: {'ON' if runtime.duplicate_protection else 'OFF'}\n\n"
+            f"📊 Total: {s['total']} | ⏳ Pending: {s['pending']} | ✅ Sent: {s['sent']} | ❌ Failed: {s['failed']}\n"
+            f"👥 Admins: {s['admins']} | 💾 Size: {s['size']} bytes"
         )
 
     async def send_home(message: Message) -> None:
@@ -759,13 +759,13 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
             if data == "ui:home":
                 await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode="html")
             elif data == "ui:settings":
-                await query.message.edit_text("\u2699\ufe0f <b>Settings Menu</b>", reply_markup=settings_kb(), parse_mode="html")
+                await query.message.edit_text("⚙️ <b>Settings Menu</b>", reply_markup=settings_kb(), parse_mode="html")
             elif data == "ui:targets":
-                await query.message.edit_text("\U0001F3AF <b>Targets Menu</b>", reply_markup=targets_kb(), parse_mode="html")
+                await query.message.edit_text("🎯 <b>Targets Menu</b>", reply_markup=targets_kb(), parse_mode="html")
             elif data == "ui:queue":
-                await query.message.edit_text("\U0001F4E6 <b>Queue Menu</b>", reply_markup=queue_kb(), parse_mode="html")
+                await query.message.edit_text("📦 <b>Queue Menu</b>", reply_markup=queue_kb(), parse_mode="html")
             elif data == "ui:admins":
-                await query.message.edit_text("\U0001F465 <b>Admins Menu</b>", reply_markup=admins_kb(), parse_mode="html")
+                await query.message.edit_text("👥 <b>Admins Menu</b>", reply_markup=admins_kb(), parse_mode="html")
             elif data == "ui:toggle":
                 runtime.is_enabled = not runtime.is_enabled
                 await session.commit()
@@ -773,58 +773,58 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
             elif data == "ui:toggle_autodel":
                 runtime.auto_delete_saved = not runtime.auto_delete_saved
                 await session.commit()
-                await query.answer("Updated \u2705")
+                await query.answer("Updated ✅")
             elif data == "ui:toggle_dupe":
                 runtime.duplicate_protection = not runtime.duplicate_protection
                 await session.commit()
-                await query.answer("Updated \u2705")
+                await query.answer("Updated ✅")
             elif data == "ui:set_delay":
                 input_state[user_id] = "set_delay"
-                await query.message.reply_text("\u23F1\ufe0f Send new delay in seconds (example: 1.5)")
+                await query.message.reply_text("⏱️ Send new delay in seconds (example: 1.5)")
             elif data == "ui:set_maxsize":
                 input_state[user_id] = "set_maxsize"
-                await query.message.reply_text("\U0001F4E6 Send max size in MB (0 to disable)")
+                await query.message.reply_text("📦 Send max size in MB (0 to disable)")
             elif data == "ui:set_prefix":
                 input_state[user_id] = "set_prefix"
-                await query.message.reply_text("\U0001F4DD Send prefix text (or send `off`)", parse_mode="markdown")
+                await query.message.reply_text("📝 Send prefix text (or send `off`)", parse_mode="markdown")
             elif data == "ui:add_target":
                 input_state[user_id] = "add_target"
-                await query.message.reply_text("\u2795 Send target chat_id to add")
+                await query.message.reply_text("➕ Send target chat_id to add")
             elif data == "ui:remove_target":
                 input_state[user_id] = "remove_target"
-                await query.message.reply_text("\u2796 Send target chat_id to disable")
+                await query.message.reply_text("➖ Send target chat_id to disable")
             elif data == "ui:list_targets":
                 rows = await repo.list_destinations()
                 if not rows:
-                    await query.message.reply_text("\U0001F4ED No targets configured")
+                    await query.message.reply_text("📭 No targets configured")
                 else:
-                    txt = "\n".join([f"{'\u2705' if r.is_enabled else '\u23F8\ufe0f'} {r.chat_id}" for r in rows])
-                    await query.message.reply_text(f"\U0001F3AF Targets\n{txt}")
+                    txt = "\n".join([f"{'✅' if r.is_enabled else '⏸️'} {r.chat_id}" for r in rows])
+                    await query.message.reply_text(f"🎯 Targets\n{txt}")
             elif data == "ui:retry_failed":
                 count = await repo.retry_failed()
-                await query.message.reply_text(f"\U0001F501 Requeued failed items: {count}")
+                await query.message.reply_text(f"🔁 Requeued failed items: {count}")
             elif data == "ui:clear_queue":
                 count = await repo.clear_queue()
-                await query.message.reply_text(f"\U0001F5D1 Queue cleared: {count} rows")
+                await query.message.reply_text(f"🗑️ Queue cleared: {count} rows")
             elif data == "ui:add_admin":
                 input_state[user_id] = "add_admin"
-                await query.message.reply_text("\U0001F465 Send: <user_id> <owner|admin|viewer>")
+                await query.message.reply_text("👥 Send: <user_id> <owner|admin|viewer>")
             elif data == "ui:remove_admin":
                 input_state[user_id] = "remove_admin"
-                await query.message.reply_text("\U0001F465 Send admin user_id to remove")
+                await query.message.reply_text("👥 Send admin user_id to remove")
             elif data == "ui:list_admins":
                 rows = await repo.list_admins()
                 if not rows:
-                    await query.message.reply_text("\U0001F4ED No active admins")
+                    await query.message.reply_text("📭 No active admins")
                 else:
-                    txt = "\n".join([f"\U0001F464 {r.tg_user_id} - {r.role.value}" for r in rows])
-                    await query.message.reply_text(f"\U0001F465 Admins\n{txt}")
+                    txt = "\n".join([f"👤 {r.tg_user_id} - {r.role.value}" for r in rows])
+                    await query.message.reply_text(f"👥 Admins\n{txt}")
             elif data == "ui:webpanel":
                 if not settings.web_panel_enabled:
-                    await query.message.reply_text("\U0001F310 Web panel disabled. Set WEB_PANEL_ENABLED=true")
+                    await query.message.reply_text("🌐 Web panel disabled. Set WEB_PANEL_ENABLED=true")
                 else:
                     token_part = f"?t={settings.web_panel_token}" if settings.web_panel_token else ""
-                    await query.message.reply_text(f"\U0001F310 Panel: http://{settings.web_panel_host}:{settings.web_panel_port}/{token_part}")
+                    await query.message.reply_text(f"🌐 Panel: http://{settings.web_panel_host}:{settings.web_panel_port}/{token_part}")
 
         await query.answer()
 
@@ -853,26 +853,26 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
                         raise ValueError
                     runtime.delay_seconds = delay
                     await session.commit()
-                    await message.reply_text(f"\u23F1\ufe0f Delay updated: {delay}s")
+                    await message.reply_text(f"⏱️ Delay updated: {delay}s")
                 elif action == "set_maxsize":
                     mb = int(text)
                     if mb < 0:
                         raise ValueError
                     runtime.max_file_size_mb = mb
                     await session.commit()
-                    await message.reply_text(f"\U0001F4E6 Max size updated: {mb} MB")
+                    await message.reply_text(f"📦 Max size updated: {mb} MB")
                 elif action == "set_prefix":
                     runtime.caption_prefix = None if text.lower() == "off" else text
                     await session.commit()
-                    await message.reply_text("\U0001F4DD Prefix updated")
+                    await message.reply_text("📝 Prefix updated")
                 elif action == "add_target":
                     chat_id = int(text)
                     await repo.add_destination(chat_id)
-                    await message.reply_text(f"\U0001F3AF Target added: {chat_id}")
+                    await message.reply_text(f"🎯 Target added: {chat_id}")
                 elif action == "remove_target":
                     chat_id = int(text)
                     ok = await repo.disable_destination(chat_id)
-                    await message.reply_text("\U0001F9EF Target disabled" if ok else "\u274C Target not found")
+                    await message.reply_text("🧯 Target disabled" if ok else "❌ Target not found")
                 elif action == "add_admin":
                     parts = text.split()
                     if len(parts) != 2:
@@ -880,16 +880,16 @@ def register_admin_handlers(bot_client: Client, db: Database, settings: Settings
                     uid = int(parts[0])
                     role = AdminRole(parts[1].lower())
                     row = await repo.add_or_update_admin(uid, role)
-                    await message.reply_text(f"\U0001F465 Admin updated: {row.tg_user_id} ({row.role.value})")
+                    await message.reply_text(f"👥 Admin updated: {row.tg_user_id} ({row.role.value})")
                 elif action == "remove_admin":
                     uid = int(text)
                     ok = await repo.remove_admin(uid)
-                    await message.reply_text("\u2705 Admin removed" if ok else "\u274C Admin not found")
+                    await message.reply_text("✅ Admin removed" if ok else "❌ Admin not found")
             except Exception:
-                await message.reply_text("\u26A0\ufe0f Invalid input. Please use the requested format.")
+                await message.reply_text("⚠️ Invalid input. Please use the requested format.")
 def build_dashboard_html(stats: dict[str, int], runtime: RuntimeSetting, token_suffix: str) -> str:
     prefix = escape(runtime.caption_prefix or "(none)")
-    state = "\u2705 Enabled" if runtime.is_enabled else "\u23f8\ufe0f Disabled"
+    state = "✅ Enabled" if runtime.is_enabled else "⏸️ Disabled"
     return f"""
     <html><head><title>Media Auto Forward Panel</title>
     <style>
@@ -899,23 +899,23 @@ def build_dashboard_html(stats: dict[str, int], runtime: RuntimeSetting, token_s
       input {{ padding:8px; }}
     </style></head>
     <body>
-      <div class='card'><h2>\U0001F916 Media Auto-Forward Dashboard</h2><p>Status: <b>{state}</b></p></div>
+      <div class='card'><h2>🤖 Media Auto-Forward Dashboard</h2><p>Status: <b>{state}</b></p></div>
       <div class='card'>
-        <h3>\U0001F4CA Live Stats</h3>
-        <p>\U0001F4E6 Total: {stats['total']} | \u23F3 Pending: {stats['pending']} | \u2705 Sent: {stats['sent']} | \u274C Failed: {stats['failed']}</p>
-        <p>\U0001F465 Admins: {stats['admins']} | \U0001F4BE Size: {stats['size']} bytes</p>
+        <h3>📊 Live Stats</h3>
+        <p>📦 Total: {stats['total']} | ⏳ Pending: {stats['pending']} | ✅ Sent: {stats['sent']} | ❌ Failed: {stats['failed']}</p>
+        <p>👥 Admins: {stats['admins']} | 💾 Size: {stats['size']} bytes</p>
       </div>
       <div class='card'>
-        <h3>\u2699\ufe0f Settings</h3>
+        <h3>⚙️ Settings</h3>
         <p>Delay: {runtime.delay_seconds}s | Max Size: {runtime.max_file_size_mb}MB | Prefix: {prefix}</p>
-        <form method='post' action='/toggle{token_suffix}'><button name='enabled' value='1'>\u2705 Enable</button><button name='enabled' value='0'>\u23f8\ufe0f Disable</button></form>
-        <form method='post' action='/delay{token_suffix}'>\u23f1\ufe0f Delay(s): <input name='value' /><button type='submit'>Update</button></form>
-        <form method='post' action='/prefix{token_suffix}'>\U0001F4DD Prefix: <input name='value' /><button type='submit'>Update</button></form>
+        <form method='post' action='/toggle{token_suffix}'><button name='enabled' value='1'>✅ Enable</button><button name='enabled' value='0'>⏸️ Disable</button></form>
+        <form method='post' action='/delay{token_suffix}'>⏱️ Delay(s): <input name='value' /><button type='submit'>Update</button></form>
+        <form method='post' action='/prefix{token_suffix}'>📝 Prefix: <input name='value' /><button type='submit'>Update</button></form>
       </div>
       <div class='card'>
-        <h3>\U0001F9F0 Queue Actions</h3>
-        <form method='post' action='/retryfailed{token_suffix}'><button type='submit'>\U0001F501 Retry Failed</button></form>
-        <form method='post' action='/clearqueue{token_suffix}'><button type='submit'>\U0001F5D1 Clear Queue</button></form>
+        <h3>🧰 Queue Actions</h3>
+        <form method='post' action='/retryfailed{token_suffix}'><button type='submit'>🔁 Retry Failed</button></form>
+        <form method='post' action='/clearqueue{token_suffix}'><button type='submit'>🗑️ Clear Queue</button></form>
       </div>
     </body></html>
     """
@@ -1078,3 +1078,6 @@ async def run() -> None:
 
 if __name__ == "__main__":
     asyncio.run(run())
+
+
+
