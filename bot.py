@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -5,16 +6,17 @@ import contextlib
 import logging
 import signal
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
+from html import escape
 from typing import Dict, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.types import Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -41,6 +43,7 @@ class Settings(BaseSettings):
     api_id: int = Field(..., alias="API_ID")
     api_hash: str = Field(..., alias="API_HASH")
     user_session_name: str = Field("user_session", alias="USER_SESSION_NAME")
+    user_session_string: Optional[str] = Field(default=None, alias="USER_SESSION_STRING")
 
     bot_token: str = Field(..., alias="BOT_TOKEN")
     bot_session_name: str = Field("admin_bot", alias="BOT_SESSION_NAME")
@@ -50,10 +53,14 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: float = Field(1.0, alias="POLL_INTERVAL_SECONDS")
     max_retries: int = Field(5, alias="MAX_RETRIES")
+    retry_backoff_seconds: float = Field(8.0, alias="RETRY_BACKOFF_SECONDS")
     album_flush_seconds: float = Field(1.8, alias="ALBUM_FLUSH_SECONDS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
-    # user_session_string: str = Field(..., alias="SESSION_STRING")
 
+    web_panel_enabled: bool = Field(False, alias="WEB_PANEL_ENABLED")
+    web_panel_host: str = Field("0.0.0.0", alias="WEB_PANEL_HOST")
+    web_panel_port: int = Field(8080, alias="WEB_PANEL_PORT")
+    web_panel_token: Optional[str] = Field(default=None, alias="WEB_PANEL_TOKEN")
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -64,7 +71,7 @@ class Settings(BaseSettings):
             return [int(v) for v in value]
         if isinstance(value, str):
             return [int(v.strip()) for v in value.split(",") if v.strip()]
-        raise ValueError("ADMIN_IDS must be comma separated.")
+        raise ValueError("ADMIN_IDS must be comma-separated.")
 
 
 @lru_cache(maxsize=1)
@@ -97,6 +104,12 @@ class DeliveryStatus(str, Enum):
     skipped = "skipped"
 
 
+class AdminRole(str, Enum):
+    owner = "owner"
+    admin = "admin"
+    viewer = "viewer"
+
+
 class Destination(Base):
     __tablename__ = "destinations"
 
@@ -104,6 +117,8 @@ class Destination(Base):
     chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    deliveries: Mapped[list["Delivery"]] = relationship(back_populates="destination", cascade="all, delete-orphan")
 
 
 class QueueItem(Base):
@@ -118,9 +133,10 @@ class QueueItem(Base):
     file_type: Mapped[str] = mapped_column(String(32), nullable=False)
     caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_size: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    status: Mapped[QueueStatus] = mapped_column(SqlEnum(QueueStatus), default=QueueStatus.pending, nullable=False)
+    status: Mapped[QueueStatus] = mapped_column(SqlEnum(QueueStatus), default=QueueStatus.pending, nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -134,12 +150,13 @@ class Delivery(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     queue_item_id: Mapped[int] = mapped_column(ForeignKey("queue_items.id", ondelete="CASCADE"), nullable=False, index=True)
     destination_id: Mapped[int] = mapped_column(ForeignKey("destinations.id", ondelete="CASCADE"), nullable=False, index=True)
-    status: Mapped[DeliveryStatus] = mapped_column(SqlEnum(DeliveryStatus), default=DeliveryStatus.pending, nullable=False)
+    status: Mapped[DeliveryStatus] = mapped_column(SqlEnum(DeliveryStatus), default=DeliveryStatus.pending, nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     queue_item: Mapped[QueueItem] = relationship(back_populates="deliveries")
+    destination: Mapped[Destination] = relationship(back_populates="deliveries")
 
 
 class RuntimeSetting(Base):
@@ -152,6 +169,16 @@ class RuntimeSetting(Base):
     caption_prefix: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     auto_delete_saved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     duplicate_protection: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    role: Mapped[AdminRole] = mapped_column(SqlEnum(AdminRole), default=AdminRole.admin, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Database:
@@ -199,6 +226,49 @@ class Repository:
     async def get_runtime_settings(self) -> RuntimeSetting:
         row = await self.session.get(RuntimeSetting, 1)
         return row if row else await self.ensure_runtime_settings()
+
+    async def bootstrap_admins(self, admin_ids: List[int]) -> None:
+        for user_id in admin_ids:
+            existing = await self.session.scalar(select(AdminUser).where(AdminUser.tg_user_id == user_id))
+            if existing:
+                if not existing.is_active:
+                    existing.is_active = True
+                if existing.role != AdminRole.owner:
+                    existing.role = AdminRole.owner
+                continue
+            self.session.add(AdminUser(tg_user_id=user_id, role=AdminRole.owner, is_active=True))
+        await self.session.commit()
+
+    async def get_admin(self, user_id: int) -> Optional[AdminUser]:
+        return await self.session.scalar(
+            select(AdminUser).where(AdminUser.tg_user_id == user_id, AdminUser.is_active.is_(True))
+        )
+
+    async def add_or_update_admin(self, user_id: int, role: AdminRole) -> AdminUser:
+        row = await self.session.scalar(select(AdminUser).where(AdminUser.tg_user_id == user_id))
+        if row:
+            row.role = role
+            row.is_active = True
+            await self.session.commit()
+            return row
+        row = AdminUser(tg_user_id=user_id, role=role, is_active=True)
+        self.session.add(row)
+        await self.session.commit()
+        return row
+
+    async def remove_admin(self, user_id: int) -> bool:
+        row = await self.session.scalar(select(AdminUser).where(AdminUser.tg_user_id == user_id))
+        if not row:
+            return False
+        row.is_active = False
+        await self.session.commit()
+        return True
+
+    async def list_admins(self) -> list[AdminUser]:
+        rows = await self.session.scalars(
+            select(AdminUser).where(AdminUser.is_active.is_(True)).order_by(AdminUser.created_at.asc())
+        )
+        return list(rows)
 
     async def add_destination(self, chat_id: int) -> Destination:
         row = await self.session.scalar(select(Destination).where(Destination.chat_id == chat_id))
@@ -252,8 +322,9 @@ class Repository:
         )
         self.session.add(item)
         await self.session.flush()
-        for d in dests:
-            self.session.add(Delivery(queue_item_id=item.id, destination_id=d.id, status=DeliveryStatus.pending))
+
+        for dest in dests:
+            self.session.add(Delivery(queue_item_id=item.id, destination_id=dest.id, status=DeliveryStatus.pending))
 
         try:
             await self.session.commit()
@@ -263,54 +334,113 @@ class Repository:
         return item
 
     async def fetch_next_item(self) -> Optional[QueueItem]:
+        now = datetime.now(timezone.utc)
         item = await self.session.scalar(
             select(QueueItem)
-            .where(QueueItem.status.in_([QueueStatus.pending, QueueStatus.failed]))
+            .where(
+                QueueItem.status == QueueStatus.pending,
+                ((QueueItem.next_retry_at.is_(None)) | (QueueItem.next_retry_at <= now)),
+            )
             .order_by(QueueItem.created_at.asc())
             .limit(1)
         )
         if not item:
             return None
+
         full = await self.session.scalar(
-            select(QueueItem).where(QueueItem.id == item.id).options(selectinload(QueueItem.deliveries))
+            select(QueueItem)
+            .where(QueueItem.id == item.id)
+            .options(selectinload(QueueItem.deliveries).selectinload(Delivery.destination))
         )
         if not full:
             return None
+
         full.status = QueueStatus.sending
         await self.session.commit()
         return full
 
     async def refresh_item(self, item_id: int) -> Optional[QueueItem]:
-        return await self.session.scalar(select(QueueItem).where(QueueItem.id == item_id).options(selectinload(QueueItem.deliveries)))
+        return await self.session.scalar(
+            select(QueueItem)
+            .where(QueueItem.id == item_id)
+            .options(selectinload(QueueItem.deliveries).selectinload(Delivery.destination))
+        )
 
-    async def increment_attempt(self, item_id: int, error: str) -> None:
+    async def update_delivery(self, delivery_id: int, status: DeliveryStatus, error_text: Optional[str] = None) -> None:
+        values: dict[str, object] = {"status": status, "error_text": error_text}
+        if status == DeliveryStatus.sent:
+            values["sent_at"] = datetime.now(timezone.utc)
+        if status == DeliveryStatus.failed:
+            delivery = await self.session.get(Delivery, delivery_id)
+            if delivery:
+                values["attempts"] = delivery.attempts + 1
+        await self.session.execute(update(Delivery).where(Delivery.id == delivery_id).values(**values))
+        await self.session.commit()
+
+    async def schedule_retry(self, item_id: int, error_text: str, max_retries: int, base_backoff: float) -> None:
         row = await self.session.get(QueueItem, item_id)
         if not row:
             return
         row.attempts += 1
-        row.error_text = error
-        await self.session.commit()
+        row.error_text = error_text
 
-    async def update_delivery(self, delivery_id: int, status: DeliveryStatus, error_text: Optional[str] = None) -> None:
-        values = {"status": status, "error_text": error_text}
-        if status == DeliveryStatus.sent:
-            values["sent_at"] = datetime.now(timezone.utc)
-        await self.session.execute(update(Delivery).where(Delivery.id == delivery_id).values(**values))
-        await self.session.commit()
-
-    async def finalize_item(self, row: QueueItem, max_retries: int) -> QueueItem:
-        sent = sum(1 for d in row.deliveries if d.status == DeliveryStatus.sent)
-        failed = sum(1 for d in row.deliveries if d.status == DeliveryStatus.failed)
-        if row.deliveries and sent == len(row.deliveries):
-            row.status = QueueStatus.sent
-            row.sent_at = datetime.now(timezone.utc)
-            row.error_text = None
-        elif row.attempts >= max_retries or failed > 0:
+        if row.attempts >= max_retries:
             row.status = QueueStatus.failed
+            row.next_retry_at = None
         else:
+            delay = max(1.0, base_backoff * (2 ** max(0, row.attempts - 1)))
             row.status = QueueStatus.pending
+            row.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         await self.session.commit()
-        return row
+
+    async def mark_item_sent(self, item_id: int) -> None:
+        row = await self.session.get(QueueItem, item_id)
+        if not row:
+            return
+        row.status = QueueStatus.sent
+        row.sent_at = datetime.now(timezone.utc)
+        row.error_text = None
+        row.next_retry_at = None
+        await self.session.commit()
+
+    async def finalize_item(self, row: QueueItem) -> QueueStatus:
+        sent_count = sum(1 for d in row.deliveries if d.status == DeliveryStatus.sent)
+        retryable_count = sum(1 for d in row.deliveries if d.status in (DeliveryStatus.failed, DeliveryStatus.pending))
+
+        if row.deliveries and sent_count == len(row.deliveries):
+            await self.mark_item_sent(row.id)
+            return QueueStatus.sent
+
+        if retryable_count > 0:
+            row.status = QueueStatus.pending
+            await self.session.commit()
+            return QueueStatus.pending
+
+        row.status = QueueStatus.failed
+        await self.session.commit()
+        return QueueStatus.failed
+
+    async def reset_delivery_failures(self, item_id: int) -> None:
+        await self.session.execute(
+            update(Delivery)
+            .where(Delivery.queue_item_id == item_id, Delivery.status == DeliveryStatus.failed)
+            .values(status=DeliveryStatus.pending, error_text=None)
+        )
+        await self.session.commit()
+
+    async def retry_failed(self) -> int:
+        result = await self.session.execute(
+            update(QueueItem)
+            .where(QueueItem.status == QueueStatus.failed)
+            .values(status=QueueStatus.pending, attempts=0, error_text=None, next_retry_at=None)
+        )
+        await self.session.execute(
+            update(Delivery)
+            .where(Delivery.status == DeliveryStatus.failed)
+            .values(status=DeliveryStatus.pending, attempts=0, error_text=None)
+        )
+        await self.session.commit()
+        return int(result.rowcount or 0)
 
     async def stats(self) -> dict[str, int]:
         total = await self.session.scalar(select(func.count(QueueItem.id)))
@@ -318,12 +448,14 @@ class Repository:
         sent = await self.session.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == QueueStatus.sent))
         failed = await self.session.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == QueueStatus.failed))
         size = await self.session.scalar(select(func.coalesce(func.sum(QueueItem.file_size), 0)))
+        admins = await self.session.scalar(select(func.count(AdminUser.id)).where(AdminUser.is_active.is_(True)))
         return {
             "total": int(total or 0),
             "pending": int(pending or 0),
             "sent": int(sent or 0),
             "failed": int(failed or 0),
             "size": int(size or 0),
+            "admins": int(admins or 0),
         }
 
     async def clear_queue(self) -> int:
@@ -343,11 +475,11 @@ def extract_media_payload(message: Message) -> Optional[dict[str, object]]:
         return {"file_type": "audio", "file_id": message.audio.file_id, "file_unique_id": message.audio.file_unique_id, "file_size": message.audio.file_size}
     return None
 
+
 @dataclass(slots=True)
 class AlbumBucket:
     messages: List[Message]
     flush_task: asyncio.Task[None]
-
 
 class SavedMessagesListener:
     def __init__(self, user_client: Client, db: Database, settings: Settings) -> None:
@@ -400,12 +532,14 @@ class SavedMessagesListener:
             return
         async with self.db.session() as session:
             repo = Repository(session)
-            settings = await repo.get_runtime_settings()
-            if not settings.is_enabled:
+            runtime = await repo.get_runtime_settings()
+            if not runtime.is_enabled:
                 return
-            if settings.max_file_size_mb > 0:
-                limit = settings.max_file_size_mb * 1024 * 1024
+
+            if runtime.max_file_size_mb > 0:
+                limit = runtime.max_file_size_mb * 1024 * 1024
                 if media["file_size"] and int(media["file_size"]) > limit:
+                    logger.info("Skipped by size limit: %s", message.id)
                     return
 
             payload = MediaPayload(
@@ -418,7 +552,9 @@ class SavedMessagesListener:
                 caption=message.caption,
                 file_size=int(media["file_size"]) if media["file_size"] else None,
             )
-            await repo.enqueue_media(payload, skip_if_duplicate=settings.duplicate_protection)
+            queued = await repo.enqueue_media(payload, skip_if_duplicate=runtime.duplicate_protection)
+            if queued:
+                logger.info("Queued message_id=%s queue_id=%s", message.id, queued.id)
 
 
 class QueueWorker:
@@ -429,6 +565,7 @@ class QueueWorker:
         self.stop_event = asyncio.Event()
 
     async def run(self) -> None:
+        logger.info("Queue worker started")
         while not self.stop_event.is_set():
             try:
                 async with self.db.session() as session:
@@ -443,240 +580,434 @@ class QueueWorker:
                         await asyncio.sleep(self.settings.poll_interval_seconds)
                         continue
 
-                    destinations = list(await session.scalars(select(Destination).where(Destination.is_enabled.is_(True))))
-                    for delivery, dest in zip(item.deliveries, destinations):
+                    had_failure = False
+                    for delivery in item.deliveries:
                         if delivery.status == DeliveryStatus.sent:
                             continue
+
+                        destination = delivery.destination
+                        if destination is None or not destination.is_enabled:
+                            await repo.update_delivery(delivery.id, DeliveryStatus.skipped, "Destination disabled")
+                            continue
+
                         caption = item.caption
                         if runtime.caption_prefix:
                             caption = f"{runtime.caption_prefix}\n\n{item.caption}" if item.caption else runtime.caption_prefix
+
                         await asyncio.sleep(max(0.0, runtime.delay_seconds))
-                        await self.send_one(repo, item.id, delivery.id, item.source_chat_id, item.source_message_id, dest.chat_id, caption)
+                        ok, err = await self.send_one(item.source_chat_id, item.source_message_id, destination.chat_id, caption)
+                        if ok:
+                            await repo.update_delivery(delivery.id, DeliveryStatus.sent)
+                        else:
+                            had_failure = True
+                            await repo.update_delivery(delivery.id, DeliveryStatus.failed, err)
 
                     fresh = await repo.refresh_item(item.id)
                     if not fresh:
                         continue
-                    done = await repo.finalize_item(fresh, self.settings.max_retries)
-                    if done.status == QueueStatus.sent and runtime.auto_delete_saved:
-                        with contextlib.suppress(Exception):
-                            await self.user_client.delete_messages("me", done.source_message_id)
+
+                    if had_failure:
+                        await repo.schedule_retry(
+                            item.id,
+                            error_text="Delivery failure. Auto-retry scheduled.",
+                            max_retries=self.settings.max_retries,
+                            base_backoff=self.settings.retry_backoff_seconds,
+                        )
+                        await repo.reset_delivery_failures(item.id)
+                    else:
+                        final_status = await repo.finalize_item(fresh)
+                        if final_status == QueueStatus.sent and runtime.auto_delete_saved:
+                            with contextlib.suppress(Exception):
+                                await self.user_client.delete_messages("me", item.source_message_id)
             except Exception:
                 logger.exception("Worker loop failed")
                 await asyncio.sleep(self.settings.poll_interval_seconds)
 
-    async def send_one(self, repo: Repository, item_id: int, delivery_id: int, from_chat: int, msg_id: int, to_chat: int, caption: Optional[str]) -> None:
+    async def send_one(
+        self,
+        from_chat: int,
+        msg_id: int,
+        to_chat: int,
+        caption: Optional[str],
+    ) -> tuple[bool, Optional[str]]:
         try:
             await self.user_client.copy_message(chat_id=to_chat, from_chat_id=from_chat, message_id=msg_id, caption=caption)
-            await repo.update_delivery(delivery_id, DeliveryStatus.sent)
+            return True, None
         except FloodWait as exc:
-            await repo.update_delivery(delivery_id, DeliveryStatus.failed, f"FloodWait({exc.value})")
-            await repo.increment_attempt(item_id, f"FloodWait({exc.value})")
             await asyncio.sleep(exc.value + 1)
+            return False, f"FloodWait({exc.value})"
         except RPCError as exc:
-            await repo.update_delivery(delivery_id, DeliveryStatus.failed, str(exc))
-            await repo.increment_attempt(item_id, str(exc))
+            return False, str(exc)
         except Exception as exc:
-            await repo.update_delivery(delivery_id, DeliveryStatus.failed, str(exc))
-            await repo.increment_attempt(item_id, str(exc))
+            return False, str(exc)
 
     async def stop(self) -> None:
         self.stop_event.set()
 
 
-def register_admin_handlers(bot_client: Client, db: Database, admin_ids: set[int]) -> None:
-    async def guard(message: Message) -> bool:
-        uid = message.from_user.id if message.from_user else None
-        if uid not in admin_ids:
-            await message.reply_text("Unauthorized.")
-            return False
-        return True
+def register_admin_handlers(bot_client: Client, db: Database, settings: Settings) -> None:
+    input_state: dict[int, str] = {}
 
-    @bot_client.on_message(filters.command(["start", "help"]))
-    async def help_cmd(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        await message.reply_text(
-            "Commands:\n"
-            "/enable | /disable\n"
-            "/setdelay <seconds>\n"
-            "/setmaxsize <mb>\n"
-            "/setprefix <text> | /setprefix off\n"
-            "/autodelete on|off\n"
-            "/dupe on|off\n"
-            "/adddest <chat_id>\n"
-            "/removedest <chat_id>\n"
-            "/listdest\n"
-            "/stats\n"
-            "/clearqueue"
+    def main_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("\u26A1 Toggle", callback_data="ui:toggle"), InlineKeyboardButton("\U0001F504 Refresh", callback_data="ui:home")],
+                [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="ui:settings"), InlineKeyboardButton("\U0001F3AF Targets", callback_data="ui:targets")],
+                [InlineKeyboardButton("\U0001F4E6 Queue", callback_data="ui:queue"), InlineKeyboardButton("\U0001F465 Admins", callback_data="ui:admins")],
+                [InlineKeyboardButton("\U0001F310 Web Panel Link", callback_data="ui:webpanel")],
+            ]
         )
 
-    @bot_client.on_message(filters.command("enable"))
-    async def enable_cmd(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
+    def settings_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("\u23F1\ufe0f Set Delay", callback_data="ui:set_delay"), InlineKeyboardButton("\U0001F4E6 Set Max Size", callback_data="ui:set_maxsize")],
+                [InlineKeyboardButton("\U0001F4DD Set Prefix", callback_data="ui:set_prefix"), InlineKeyboardButton("\U0001F9F9 Toggle AutoDelete", callback_data="ui:toggle_autodel")],
+                [InlineKeyboardButton("\U0001F6E1 Toggle Dupe Protection", callback_data="ui:toggle_dupe")],
+                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+            ]
+        )
+
+    def targets_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("\u2795 Add Target", callback_data="ui:add_target"), InlineKeyboardButton("\u2796 Remove Target", callback_data="ui:remove_target")],
+                [InlineKeyboardButton("\U0001F4CB List Targets", callback_data="ui:list_targets")],
+                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+            ]
+        )
+
+    def queue_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("\U0001F501 Retry Failed", callback_data="ui:retry_failed"), InlineKeyboardButton("\U0001F5D1 Clear Queue", callback_data="ui:clear_queue")],
+                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+            ]
+        )
+
+    def admins_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("\u2795 Add/Update Admin", callback_data="ui:add_admin"), InlineKeyboardButton("\u2796 Remove Admin", callback_data="ui:remove_admin")],
+                [InlineKeyboardButton("\U0001F4CB List Admins", callback_data="ui:list_admins")],
+                [InlineKeyboardButton("\u2B05\ufe0f Back", callback_data="ui:home")],
+            ]
+        )
+
+    async def get_admin(user_id: int) -> Optional[AdminUser]:
+        async with db.session() as session:
+            return await Repository(session).get_admin(user_id)
+
+    async def guard_user(user_id: Optional[int], min_role: AdminRole = AdminRole.admin) -> tuple[bool, Optional[AdminUser], str]:
+        if user_id is None:
+            return False, None, "\U0001F6D1 Unauthorized"
+        rec = await get_admin(user_id)
+        if rec is None:
+            return False, None, "\U0001F6D1 Unauthorized"
+        order = {AdminRole.viewer: 1, AdminRole.admin: 2, AdminRole.owner: 3}
+        if order[rec.role] < order[min_role]:
+            return False, rec, "\U0001F6AB Permission denied"
+        return True, rec, ""
+
+    async def build_status_text() -> str:
         async with db.session() as session:
             repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.is_enabled = True
-            await session.commit()
-        await message.reply_text("Enabled.")
+            runtime = await repo.get_runtime_settings()
+            s = await repo.stats()
+        return (
+            "\U0001F916 <b>Media Auto-Forward Control Center</b>\n"
+            f"Status: {'\u2705 Enabled' if runtime.is_enabled else '\u23f8\ufe0f Disabled'}\n"
+            f"\u23F1\ufe0f Delay: {runtime.delay_seconds}s | \U0001F4E6 Max: {runtime.max_file_size_mb}MB\n"
+            f"\U0001F4DD Prefix: {(runtime.caption_prefix or '(none)')}\n"
+            f"\U0001F9F9 AutoDelete: {'ON' if runtime.auto_delete_saved else 'OFF'} | \U0001F6E1 Dupe: {'ON' if runtime.duplicate_protection else 'OFF'}\n\n"
+            f"\U0001F4CA Total: {s['total']} | \u23F3 Pending: {s['pending']} | \u2705 Sent: {s['sent']} | \u274C Failed: {s['failed']}\n"
+            f"\U0001F465 Admins: {s['admins']} | \U0001F4BE Size: {s['size']} bytes"
+        )
 
-    @bot_client.on_message(filters.command("disable"))
-    async def disable_cmd(_: Client, message: Message) -> None:
-        if not await guard(message):
+    async def send_home(message: Message) -> None:
+        await message.reply_text(await build_status_text(), reply_markup=main_kb(), parse_mode="html")
+
+    @bot_client.on_message(filters.command(["start", "help"]))
+    async def start_cmd(_: Client, message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        allowed, _, err = await guard_user(user_id, AdminRole.viewer)
+        if not allowed:
+            await message.reply_text(err)
             return
+        await send_home(message)
+
+    @bot_client.on_callback_query(filters.regex("^ui:"))
+    async def callbacks(_: Client, query: CallbackQuery) -> None:
+        user_id = query.from_user.id if query.from_user else None
+        data = query.data or ""
+
+        min_role = AdminRole.viewer
+        if data in {"ui:toggle", "ui:set_delay", "ui:set_maxsize", "ui:set_prefix", "ui:toggle_autodel", "ui:toggle_dupe", "ui:add_target", "ui:remove_target", "ui:retry_failed"}:
+            min_role = AdminRole.admin
+        if data in {"ui:clear_queue", "ui:add_admin", "ui:remove_admin", "ui:list_admins"}:
+            min_role = AdminRole.owner
+
+        allowed, _, err = await guard_user(user_id, min_role)
+        if not allowed:
+            await query.answer(err, show_alert=True)
+            return
+
         async with db.session() as session:
             repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.is_enabled = False
-            await session.commit()
-        await message.reply_text("Disabled.")
+            runtime = await repo.get_runtime_settings()
 
-    @bot_client.on_message(filters.command("setdelay"))
-    async def set_delay(_: Client, message: Message) -> None:
-        if not await guard(message):
+            if data == "ui:home":
+                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode="html")
+            elif data == "ui:settings":
+                await query.message.edit_text("\u2699\ufe0f <b>Settings Menu</b>", reply_markup=settings_kb(), parse_mode="html")
+            elif data == "ui:targets":
+                await query.message.edit_text("\U0001F3AF <b>Targets Menu</b>", reply_markup=targets_kb(), parse_mode="html")
+            elif data == "ui:queue":
+                await query.message.edit_text("\U0001F4E6 <b>Queue Menu</b>", reply_markup=queue_kb(), parse_mode="html")
+            elif data == "ui:admins":
+                await query.message.edit_text("\U0001F465 <b>Admins Menu</b>", reply_markup=admins_kb(), parse_mode="html")
+            elif data == "ui:toggle":
+                runtime.is_enabled = not runtime.is_enabled
+                await session.commit()
+                await query.message.edit_text(await build_status_text(), reply_markup=main_kb(), parse_mode="html")
+            elif data == "ui:toggle_autodel":
+                runtime.auto_delete_saved = not runtime.auto_delete_saved
+                await session.commit()
+                await query.answer("Updated \u2705")
+            elif data == "ui:toggle_dupe":
+                runtime.duplicate_protection = not runtime.duplicate_protection
+                await session.commit()
+                await query.answer("Updated \u2705")
+            elif data == "ui:set_delay":
+                input_state[user_id] = "set_delay"
+                await query.message.reply_text("\u23F1\ufe0f Send new delay in seconds (example: 1.5)")
+            elif data == "ui:set_maxsize":
+                input_state[user_id] = "set_maxsize"
+                await query.message.reply_text("\U0001F4E6 Send max size in MB (0 to disable)")
+            elif data == "ui:set_prefix":
+                input_state[user_id] = "set_prefix"
+                await query.message.reply_text("\U0001F4DD Send prefix text (or send `off`)", parse_mode="markdown")
+            elif data == "ui:add_target":
+                input_state[user_id] = "add_target"
+                await query.message.reply_text("\u2795 Send target chat_id to add")
+            elif data == "ui:remove_target":
+                input_state[user_id] = "remove_target"
+                await query.message.reply_text("\u2796 Send target chat_id to disable")
+            elif data == "ui:list_targets":
+                rows = await repo.list_destinations()
+                if not rows:
+                    await query.message.reply_text("\U0001F4ED No targets configured")
+                else:
+                    txt = "\n".join([f"{'\u2705' if r.is_enabled else '\u23F8\ufe0f'} {r.chat_id}" for r in rows])
+                    await query.message.reply_text(f"\U0001F3AF Targets\n{txt}")
+            elif data == "ui:retry_failed":
+                count = await repo.retry_failed()
+                await query.message.reply_text(f"\U0001F501 Requeued failed items: {count}")
+            elif data == "ui:clear_queue":
+                count = await repo.clear_queue()
+                await query.message.reply_text(f"\U0001F5D1 Queue cleared: {count} rows")
+            elif data == "ui:add_admin":
+                input_state[user_id] = "add_admin"
+                await query.message.reply_text("\U0001F465 Send: <user_id> <owner|admin|viewer>")
+            elif data == "ui:remove_admin":
+                input_state[user_id] = "remove_admin"
+                await query.message.reply_text("\U0001F465 Send admin user_id to remove")
+            elif data == "ui:list_admins":
+                rows = await repo.list_admins()
+                if not rows:
+                    await query.message.reply_text("\U0001F4ED No active admins")
+                else:
+                    txt = "\n".join([f"\U0001F464 {r.tg_user_id} - {r.role.value}" for r in rows])
+                    await query.message.reply_text(f"\U0001F465 Admins\n{txt}")
+            elif data == "ui:webpanel":
+                if not settings.web_panel_enabled:
+                    await query.message.reply_text("\U0001F310 Web panel disabled. Set WEB_PANEL_ENABLED=true")
+                else:
+                    token_part = f"?t={settings.web_panel_token}" if settings.web_panel_token else ""
+                    await query.message.reply_text(f"\U0001F310 Panel: http://{settings.web_panel_host}:{settings.web_panel_port}/{token_part}")
+
+        await query.answer()
+
+    @bot_client.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
+    async def text_input(_: Client, message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is None or user_id not in input_state:
             return
-        if len(message.command) < 2:
-            await message.reply_text("Usage: /setdelay <seconds>")
+
+        action = input_state.pop(user_id)
+        text = (message.text or "").strip()
+
+        min_role = AdminRole.admin if action in {"set_delay", "set_maxsize", "set_prefix", "add_target", "remove_target"} else AdminRole.owner
+        allowed, _, err = await guard_user(user_id, min_role)
+        if not allowed:
+            await message.reply_text(err)
             return
+
+        async with db.session() as session:
+            repo = Repository(session)
+            runtime = await repo.get_runtime_settings()
+            try:
+                if action == "set_delay":
+                    delay = float(text)
+                    if delay < 0:
+                        raise ValueError
+                    runtime.delay_seconds = delay
+                    await session.commit()
+                    await message.reply_text(f"\u23F1\ufe0f Delay updated: {delay}s")
+                elif action == "set_maxsize":
+                    mb = int(text)
+                    if mb < 0:
+                        raise ValueError
+                    runtime.max_file_size_mb = mb
+                    await session.commit()
+                    await message.reply_text(f"\U0001F4E6 Max size updated: {mb} MB")
+                elif action == "set_prefix":
+                    runtime.caption_prefix = None if text.lower() == "off" else text
+                    await session.commit()
+                    await message.reply_text("\U0001F4DD Prefix updated")
+                elif action == "add_target":
+                    chat_id = int(text)
+                    await repo.add_destination(chat_id)
+                    await message.reply_text(f"\U0001F3AF Target added: {chat_id}")
+                elif action == "remove_target":
+                    chat_id = int(text)
+                    ok = await repo.disable_destination(chat_id)
+                    await message.reply_text("\U0001F9EF Target disabled" if ok else "\u274C Target not found")
+                elif action == "add_admin":
+                    parts = text.split()
+                    if len(parts) != 2:
+                        raise ValueError
+                    uid = int(parts[0])
+                    role = AdminRole(parts[1].lower())
+                    row = await repo.add_or_update_admin(uid, role)
+                    await message.reply_text(f"\U0001F465 Admin updated: {row.tg_user_id} ({row.role.value})")
+                elif action == "remove_admin":
+                    uid = int(text)
+                    ok = await repo.remove_admin(uid)
+                    await message.reply_text("\u2705 Admin removed" if ok else "\u274C Admin not found")
+            except Exception:
+                await message.reply_text("\u26A0\ufe0f Invalid input. Please use the requested format.")
+def build_dashboard_html(stats: dict[str, int], runtime: RuntimeSetting, token_suffix: str) -> str:
+    prefix = escape(runtime.caption_prefix or "(none)")
+    state = "\u2705 Enabled" if runtime.is_enabled else "\u23f8\ufe0f Disabled"
+    return f"""
+    <html><head><title>Media Auto Forward Panel</title>
+    <style>
+      body {{ font-family: Arial; max-width: 860px; margin: 20px auto; background:#f8fafc; }}
+      .card {{ background:white; padding:16px; border-radius:10px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
+      button {{ padding:8px 12px; margin:3px; }}
+      input {{ padding:8px; }}
+    </style></head>
+    <body>
+      <div class='card'><h2>\U0001F916 Media Auto-Forward Dashboard</h2><p>Status: <b>{state}</b></p></div>
+      <div class='card'>
+        <h3>\U0001F4CA Live Stats</h3>
+        <p>\U0001F4E6 Total: {stats['total']} | \u23F3 Pending: {stats['pending']} | \u2705 Sent: {stats['sent']} | \u274C Failed: {stats['failed']}</p>
+        <p>\U0001F465 Admins: {stats['admins']} | \U0001F4BE Size: {stats['size']} bytes</p>
+      </div>
+      <div class='card'>
+        <h3>\u2699\ufe0f Settings</h3>
+        <p>Delay: {runtime.delay_seconds}s | Max Size: {runtime.max_file_size_mb}MB | Prefix: {prefix}</p>
+        <form method='post' action='/toggle{token_suffix}'><button name='enabled' value='1'>\u2705 Enable</button><button name='enabled' value='0'>\u23f8\ufe0f Disable</button></form>
+        <form method='post' action='/delay{token_suffix}'>\u23f1\ufe0f Delay(s): <input name='value' /><button type='submit'>Update</button></form>
+        <form method='post' action='/prefix{token_suffix}'>\U0001F4DD Prefix: <input name='value' /><button type='submit'>Update</button></form>
+      </div>
+      <div class='card'>
+        <h3>\U0001F9F0 Queue Actions</h3>
+        <form method='post' action='/retryfailed{token_suffix}'><button type='submit'>\U0001F501 Retry Failed</button></form>
+        <form method='post' action='/clearqueue{token_suffix}'><button type='submit'>\U0001F5D1 Clear Queue</button></form>
+      </div>
+    </body></html>
+    """
+
+
+async def maybe_start_web_panel(db: Database, settings: Settings):
+    if not settings.web_panel_enabled:
+        return None
+    try:
+        from fastapi import FastAPI, Form, Request
+        from fastapi.responses import HTMLResponse, PlainTextResponse
+        import uvicorn
+    except Exception:
+        logger.warning("WEB_PANEL_ENABLED=true but fastapi/uvicorn not installed.")
+        return None
+
+    app = FastAPI(title="Media Auto Forward Panel")
+
+    def authorized(request: Request) -> bool:
+        if not settings.web_panel_token:
+            return True
+        return request.query_params.get("t") == settings.web_panel_token
+
+    @app.get("/", response_class=HTMLResponse)
+    async def home(request: Request):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
+        async with db.session() as session:
+            repo = Repository(session)
+            stats = await repo.stats()
+            runtime = await repo.get_runtime_settings()
+        token_suffix = f"?t={settings.web_panel_token}" if settings.web_panel_token else ""
+        return HTMLResponse(build_dashboard_html(stats, runtime, token_suffix))
+
+    @app.post("/toggle")
+    async def toggle(request: Request, enabled: int = Form(...)):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
+        async with db.session() as session:
+            repo = Repository(session)
+            runtime = await repo.get_runtime_settings()
+            runtime.is_enabled = enabled == 1
+            await session.commit()
+        return PlainTextResponse("OK")
+
+    @app.post("/delay")
+    async def set_delay(request: Request, value: str = Form(...)):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
         try:
-            delay = float(message.command[1])
+            delay = float(value)
             if delay < 0:
                 raise ValueError
         except ValueError:
-            await message.reply_text("Invalid delay")
-            return
+            return PlainTextResponse("Invalid", status_code=400)
         async with db.session() as session:
             repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.delay_seconds = delay
+            runtime = await repo.get_runtime_settings()
+            runtime.delay_seconds = delay
             await session.commit()
-        await message.reply_text(f"Delay updated: {delay}s")
+        return PlainTextResponse("OK")
 
-    @bot_client.on_message(filters.command("setmaxsize"))
-    async def set_max(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2:
-            await message.reply_text("Usage: /setmaxsize <mb>")
-            return
-        try:
-            mb = int(message.command[1])
-            if mb < 0:
-                raise ValueError
-        except ValueError:
-            await message.reply_text("Invalid mb")
-            return
+    @app.post("/prefix")
+    async def set_prefix(request: Request, value: str = Form("")):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
         async with db.session() as session:
             repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.max_file_size_mb = mb
+            runtime = await repo.get_runtime_settings()
+            runtime.caption_prefix = value or None
             await session.commit()
-        await message.reply_text(f"Max size updated: {mb}MB")
+        return PlainTextResponse("OK")
 
-    @bot_client.on_message(filters.command("setprefix"))
-    async def set_prefix(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2:
-            await message.reply_text("Usage: /setprefix <text> | /setprefix off")
-            return
-        content = message.text.split(maxsplit=1)[1].strip() if message.text else ""
+    @app.post("/retryfailed")
+    async def retry_failed(request: Request):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
         async with db.session() as session:
-            repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.caption_prefix = None if content.lower() == "off" else content
-            await session.commit()
-        await message.reply_text("Prefix updated.")
+            await Repository(session).retry_failed()
+        return PlainTextResponse("OK")
 
-    @bot_client.on_message(filters.command("autodelete"))
-    async def set_autodel(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2 or message.command[1].lower() not in {"on", "off"}:
-            await message.reply_text("Usage: /autodelete on|off")
-            return
-        on = message.command[1].lower() == "on"
+    @app.post("/clearqueue")
+    async def clear_queue(request: Request):
+        if not authorized(request):
+            return PlainTextResponse("Unauthorized", status_code=401)
         async with db.session() as session:
-            repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.auto_delete_saved = on
-            await session.commit()
-        await message.reply_text(f"Auto delete: {'ON' if on else 'OFF'}")
+            await Repository(session).clear_queue()
+        return PlainTextResponse("OK")
 
-    @bot_client.on_message(filters.command("dupe"))
-    async def set_dupe(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2 or message.command[1].lower() not in {"on", "off"}:
-            await message.reply_text("Usage: /dupe on|off")
-            return
-        on = message.command[1].lower() == "on"
-        async with db.session() as session:
-            repo = Repository(session)
-            row = await repo.get_runtime_settings()
-            row.duplicate_protection = on
-            await session.commit()
-        await message.reply_text(f"Duplicate protection: {'ON' if on else 'OFF'}")
-
-    @bot_client.on_message(filters.command("adddest"))
-    async def add_dest(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2:
-            await message.reply_text("Usage: /adddest <chat_id>")
-            return
-        try:
-            chat_id = int(message.command[1])
-        except ValueError:
-            await message.reply_text("chat_id must be integer")
-            return
-        async with db.session() as session:
-            await Repository(session).add_destination(chat_id)
-        await message.reply_text("Destination added.")
-
-    @bot_client.on_message(filters.command("removedest"))
-    async def remove_dest(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        if len(message.command) < 2:
-            await message.reply_text("Usage: /removedest <chat_id>")
-            return
-        try:
-            chat_id = int(message.command[1])
-        except ValueError:
-            await message.reply_text("chat_id must be integer")
-            return
-        async with db.session() as session:
-            ok = await Repository(session).disable_destination(chat_id)
-        await message.reply_text("Destination disabled." if ok else "Destination not found.")
-
-    @bot_client.on_message(filters.command("listdest"))
-    async def list_dest(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        async with db.session() as session:
-            rows = await Repository(session).list_destinations()
-        if not rows:
-            await message.reply_text("No destinations.")
-            return
-        await message.reply_text("\n".join([f"{r.chat_id} [{'on' if r.is_enabled else 'off'}]" for r in rows]))
-
-    @bot_client.on_message(filters.command("stats"))
-    async def stats(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        async with db.session() as session:
-            s = await Repository(session).stats()
-        await message.reply_text(f"Total={s['total']} Pending={s['pending']} Sent={s['sent']} Failed={s['failed']} Size={s['size']} bytes")
-
-    @bot_client.on_message(filters.command("clearqueue"))
-    async def clear_queue(_: Client, message: Message) -> None:
-        if not await guard(message):
-            return
-        async with db.session() as session:
-            c = await Repository(session).clear_queue()
-        await message.reply_text(f"Queue cleared: {c} rows")
+    config = uvicorn.Config(app, host=settings.web_panel_host, port=settings.web_panel_port, log_level="info")
+    server = uvicorn.Server(config)
+    return asyncio.create_task(server.serve())
 
 
 async def run() -> None:
@@ -686,15 +1017,19 @@ async def run() -> None:
     db = Database(settings)
     await db.create_schema()
     async with db.session() as session:
-        await Repository(session).ensure_runtime_settings()
+        repo = Repository(session)
+        await repo.ensure_runtime_settings()
+        await repo.bootstrap_admins(settings.admin_ids)
 
-    user_client = Client(
-        name=settings.user_session_name,
-        api_id=settings.api_id,
-        api_hash=settings.api_hash,
-        session_string="BQHr04QAUannPk7_63cRnlEfSBPBHoQIw65YoxP6nkBchXS_i43X9WViKtCLWa5dJXNP5kHN2gkENWajhqX-CR7ir8F5Ye1roWzMeAgj47LkLslJThMDUH69Q9kxh04flsyzv5qbHx-OrMV3KKGpLjoIYrGvXh_zIs5YI-JQIOIXwd_f7ERTx1eeNxMLawJLUKU0z2FBzw1dYNNL8dgn-Hi4a25VTI_GMy5lADx4_3FMqgLVN9P-JZpbg4iFmENz03yHE7ESe8cYqRW0KisPOwxx0nibm8mOyBLQT6pZ1SolgeNV8roNwc4b3kOUI0domGvxv6YepqY1d8VYpID7BG5IsdsA4QAAAAH62YOxAA",
-    )
+    user_client_kwargs = {
+        "name": settings.user_session_name,
+        "api_id": settings.api_id,
+        "api_hash": settings.api_hash,
+    }
+    if settings.user_session_string:
+        user_client_kwargs["session_string"] = settings.user_session_string
 
+    user_client = Client(**user_client_kwargs)
     bot_client = Client(
         name=settings.bot_session_name,
         api_id=settings.api_id,
@@ -704,7 +1039,7 @@ async def run() -> None:
 
     listener = SavedMessagesListener(user_client, db, settings)
     listener.register_handlers()
-    register_admin_handlers(bot_client, db, set(settings.admin_ids))
+    register_admin_handlers(bot_client, db, settings)
     worker = QueueWorker(user_client, db, settings)
 
     stop_event = asyncio.Event()
@@ -720,6 +1055,7 @@ async def run() -> None:
     await user_client.start()
     await bot_client.start()
     worker_task = asyncio.create_task(worker.run())
+    panel_task = await maybe_start_web_panel(db, settings)
     logger.info("medi_save_auto_forward started")
 
     try:
@@ -729,6 +1065,12 @@ async def run() -> None:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+        if panel_task:
+            panel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await panel_task
+
         await bot_client.stop()
         await user_client.stop()
         await db.dispose()
