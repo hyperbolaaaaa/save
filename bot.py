@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import signal
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +52,8 @@ class Settings(BaseSettings):
     max_retries: int = Field(5, alias="MAX_RETRIES")
     album_flush_seconds: float = Field(1.8, alias="ALBUM_FLUSH_SECONDS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
+    user_session_string: str = Field(..., alias="SESSION_STRING")
+
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -688,11 +689,12 @@ async def run() -> None:
         await Repository(session).ensure_runtime_settings()
 
     user_client = Client(
-        name="user_session",
+        name=settings.user_session_name,
         api_id=settings.api_id,
         api_hash=settings.api_hash,
-        session_string=os.getenv("SESSION_STRING")
+        session_string=settings.user_session_string,
     )
+
     bot_client = Client(
         name=settings.bot_session_name,
         api_id=settings.api_id,
