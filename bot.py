@@ -1033,7 +1033,7 @@ async def run() -> None:
         name=settings.user_session_name,
         api_id=settings.api_id,
         api_hash=settings.api_hash,
-        session_string="BQHr04QAUannPk7_63cRnlEfSBPBHoQIw65YoxP6nkBchXS_i43X9WViKtCLWa5dJXNP5kHN2gkENWajhqX-CR7ir8F5Ye1roWzMeAgj47LkLslJThMDUH69Q9kxh04flsyzv5qbHx-OrMV3KKGpLjoIYrGvXh_zIs5YI-JQIOIXwd_f7ERTx1eeNxMLawJLUKU0z2FBzw1dYNNL8dgn-Hi4a25VTI_GMy5lADx4_3FMqgLVN9P-JZpbg4iFmENz03yHE7ESe8cYqRW0KisPOwxx0nibm8mOyBLQT6pZ1SolgeNV8roNwc4b3kOUI0domGvxv6YepqY1d8VYpID7BG5IsdsA4QAAAAH62YOxAA",  # required in container
+        session_string="BAJHOo4AlfEfSi4h_dg1JOeTunZyFQjorXUnNx-ZFdhWhS30WLUr0XHDjBJN58cnQ75L8DKoHj4wPcgzIWoEj9HHaIq74Yef8eIRwVn2vQO9OCJxi1HkLCYHIYXepCHEqIrhHdp1oX9732AAnkM-6NtJXOUE3H1N3ZdlBFCLRkzdBpEcn9oISY4PT5eoFDszQqbinCN6lnfUkqH0-usvE0elN2WnXCBWorJ9zUPVL5fffrBszCOb4Z0-cJK3ro4Njh2vulJ8VS5OkuOGpbo6Xoq002cOYfNDhNiHU_Hmhf5XZYJAFSIsUO9n_5w8oAzzt84F0wk7huldQEtihQ0DUrIDQRFoXAAAAAGxwi8lAA",  # required in container
     )
 
     bot_client = Client(
